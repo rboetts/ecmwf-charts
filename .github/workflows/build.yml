@@ -1,0 +1,56 @@
+name: Build ECMWF charts
+
+on:
+  schedule:
+    - cron: "30 21 * * *"   # 21:30 UTC = 8:00 am Adelaide (daylight time) - picks up the 12 UTC run
+    - cron: "0 10 * * *"    # 10:00 UTC = 8:30 pm Adelaide (daylight time) - picks up the 00 UTC run
+    - cron: "0 3 1 * *"     # 1st of each month: keep-alive so GitHub doesn't pause the schedule
+  workflow_dispatch:        # adds a "Run workflow" button on the Actions tab
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event.schedule != '0 3 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore saved charts
+        uses: actions/cache@v4
+        with:
+          path: ens_grams_cache
+          key: charts-${{ github.run_id }}
+          restore-keys: charts-
+
+      - name: Build page
+        run: python3 ens_grams.py --split --no-open --out site/index.html
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  keepalive:
+    if: github.event.schedule == '0 3 1 * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "Keep scheduled builds active"
+          git push
