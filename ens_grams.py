@@ -69,13 +69,16 @@ ANOMALY_MAPS = [
     ("extended-anomaly-z500", "opencharts_south_pole",  "500 hPa height (South Pole)"),
 ]
 
+ANOMALY_WEEKS = 5            # how many weeks ahead to show
+ANOMALY_HISTORY = 3          # anomaly-map runs to compare, incl. latest (24 h apart)
+
 HOVMOLLER_PRODUCT = "mofc_multi_eps_family_hovmoller"
 HOVMOLLERS = [
     # (parameters, label)
     ({"area": "South Hemisphere", "parameter": "geopotential 1000 hPa"}, "SH Hovmöller, 1000 hPa geopotential"),
     ({"area": "South Hemisphere", "parameter": "geopotential 500 hPa"},  "SH Hovmöller, 500 hPa geopotential"),
 ]
-HOVMOLLER_HISTORY = 4        # latest + 3 previous
+HOVMOLLER_HISTORY = 2        # latest + 1 previous
 EXTENDED_STEP_HOURS = 24     # extended-range runs are daily at 00 UTC
 
 STRAT_CHARTS = [
@@ -85,7 +88,7 @@ STRAT_CHARTS = [
 
 API = "https://charts.ecmwf.int/opencharts-api/v1/products/{product}/"
 SITE = "https://charts.ecmwf.int/products/{product}"
-HEADERS = {"User-Agent": "ens-grams-script/1.5 (personal use)"}
+HEADERS = {"User-Agent": "ens-grams-script/1.6 (personal use)"}
 TIMEOUT = 60
 REQUEST_GAP = 1.5      # seconds between requests to ECMWF (raise if you still see 429s)
 MAX_RETRIES = 4        # retries per request after "too many requests" / busy server
@@ -321,9 +324,14 @@ figure img { width:100%; height:auto; display:block; background:#fff; border-rad
 #tab-met { --col:520px; --flick:760px; }
 #tab-met.size-s { --col:380px; --flick:560px; }
 #tab-met.size-l { --col:760px; --flick:1100px; }
-#anoms { --col:460px; --strip:240px; }
-#anoms.size-s { --col:320px; --strip:180px; }
-#anoms.size-l { --col:680px; --strip:340px; }
+#anoms { --col:460px; --strip:240px; --sbs:420px; }
+#anoms.size-s { --col:320px; --strip:180px; --sbs:300px; }
+#anoms.size-l { --col:680px; --strip:340px; --sbs:600px; }
+#anoms .an-sbs { display:none; }
+#anoms.sbs .an-sbs { display:block; }
+#anoms.sbs .an-flick { display:none; }
+#anoms .an-sbs .row { grid-template-columns:repeat(auto-fill, min(var(--sbs), 100%)); gap:12px; margin-bottom:14px; }
+#an-ctl { margin-top:4px; }
 #hov { --col:560px; }
 #hov.size-s { --col:400px; }
 #hov.size-l { --col:820px; }
@@ -412,9 +420,53 @@ Object.entries(groups).forEach(([g, G]) => {
   });
   show(g, G.n - 1);
 });
+// weekly anomaly maps: one run selector for every map
+const AN = (() => {
+  const el = document.getElementById('anom-data'); if (!el) return null;
+  const data = JSON.parse(el.textContent), n = data.runs.length;
+  const ctl = document.getElementById('an-ctl'), sec = document.getElementById('anoms');
+  const st = { idx: n - 1, n, timer: null };
+  function fill(fig, ri) {
+    const c = data.cells[fig.dataset.v + '|' + fig.dataset.w][ri];
+    const img = fig.querySelector('img'), err = fig.querySelector('.err');
+    if (c && c.s) {
+      if (img.dataset.orig !== c.s) { img.dataset.orig = c.s; img.src = c.s; }
+      img.style.display = ''; err.style.display = 'none';
+    } else {
+      img.style.display = 'none'; err.style.display = '';
+      err.textContent = 'Not available' + (c && c.e ? ': ' + c.e : '');
+    }
+    if (c) fig.querySelector('a').href = c.l;
+  }
+  function show(i) {
+    st.idx = (i + n) % n;
+    sec.querySelectorAll('.anf:not([data-r])').forEach(f => fill(f, st.idx));
+    ctl.querySelector('.lab').textContent = 'Run ' + data.runs[st.idx] + (st.idx === n - 1 ? '  (latest)' : '');
+    ctl.querySelector('input').value = st.idx;
+  }
+  sec.querySelectorAll('.anf[data-r]').forEach(f => fill(f, +f.dataset.r));
+  ctl.querySelector('input').oninput = e => show(+e.target.value);
+  ctl.querySelector('.prev').onclick = () => show(st.idx - 1);
+  ctl.querySelector('.next').onclick = () => show(st.idx + 1);
+  ctl.querySelector('.play').onclick = () => {
+    if (st.timer) { clearInterval(st.timer); st.timer = null; } else st.timer = setInterval(() => show(st.idx + 1), 1200);
+    ctl.querySelector('.play').classList.toggle('on', !!st.timer);
+  };
+  ctl.querySelectorAll('.layout button').forEach(b => b.onclick = () => {
+    sec.classList.toggle('sbs', b.dataset.lay === 'sbs');
+    ctl.querySelectorAll('.layout button').forEach(x => x.classList.toggle('on', x === b));
+  });
+  show(n - 1);
+  return { show, st };
+})();
+
 function activeGroup() {
   if (body.dataset.tab === 'met' && met.classList.contains('compare')) return 'met';
-  if (body.dataset.tab === 'ext') return 'hov';
+  if (body.dataset.tab === 'ext') {
+    const hov = document.getElementById('hov');
+    if (!AN || (hov && hov.getBoundingClientRect().top < innerHeight / 2)) return 'hov';
+    return 'anom';
+  }
   return null;
 }
 
@@ -519,9 +571,10 @@ document.addEventListener('click', e => {
 z.onclick = () => z.style.display = 'none';
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { z.style.display = 'none'; return; }
+  if (e.target.matches('textarea, input')) return;
   const g = activeGroup(); if (!g) return;
-  if (e.key === 'ArrowLeft') show(g, groups[g].idx - 1);
-  if (e.key === 'ArrowRight') show(g, groups[g].idx + 1);
+  const step = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0; if (!step) return;
+  if (g === 'anom') AN.show(AN.st.idx + step); else show(g, groups[g].idx + step);
 });
 """
 
@@ -603,40 +656,70 @@ def meteogram_tab(met_latest, met_history, R):
         f'so the time axis shifts slightly between runs.</p>' + "\n".join(sections))
 
 
-def extended_tab(anom_bt, weeks, hov_latest, hov_history, R):
+def extended_tab(anom_bt, weeks, anom_history, hov_latest, hov_history, R):
     parts = []
-    # weekly mean anomalies
+    # weekly mean anomalies, with run-to-run comparison
     parts.append('<section id="anoms"><h2>Weekly mean anomalies')
     if anom_bt is None or not weeks:
         parts.append('</h2><p class="err">No weekly anomaly charts found.</p></section>')
     else:
-        parts.append(f' <small>run {run_label(anom_bt)}</small></h2>')
+        parts.append(f' <small>latest run {run_label(anom_bt)}</small></h2>')
         btns = "".join(f'<button class="wkbtn" data-wk="{i}">Week of {w:%a %d %b}</button>'
                        for i, w in enumerate(weeks))
         parts.append(f'<div class="bar">{btns}<span class="sep"></span>'
                      f'<button class="wkbtn" data-wk="all">All weeks</button><span class="sep"></span>{sizer("anoms")}</div>')
-        # one week at a time: 2 x 2
+        nr = len(anom_history)
+        parts.append(
+            f'<div class="ctl" id="an-ctl"><button class="prev" title="Older run">&larr;</button>'
+            f'<input type="range" min="0" max="{nr - 1}" step="1" value="{nr - 1}">'
+            f'<button class="next" title="Newer run">&rarr;</button><button class="play">Play</button>'
+            f'<span class="lab"></span>'
+            f'<span class="layout" style="margin-left:auto;display:flex;gap:6px">'
+            f'<button data-lay="flick" class="on">Flick</button><button data-lay="sbs">Side by side</button></span></div>')
+        parts.append(f'<p class="hint">Last {nr} runs for the same weeks. All maps step together; '
+                     f'use the slider or &larr; / &rarr; keys, or Side by side to see the runs in a row.</p>')
+
+        def anf(vi, wi, caption, ri=None):
+            r = "" if ri is None else f' data-r="{ri}"'
+            return (f'<figure class="anf" data-v="{vi}" data-w="{wi}"{r}><figcaption><span>{esc(caption)}</span>'
+                    f'<a target="_blank" rel="noopener">open on ECMWF</a></figcaption>'
+                    f'<img alt="{esc(caption)}"><div class="err" style="display:none"></div></figure>')
+
+        # one week at a time
         parts.append('<div class="wk-one">')
-        for w in weeks:
-            figs = []
-            for prod, proj, label in ANOMALY_MAPS:
-                p = {"base_time": anom_bt, "projection": proj, "valid_time": w}
-                figs.append(figure_html(f"{label} – week of {w:%d %b}", site_url(prod, p),
-                                        R[("anom", prod, w)], f"{label} {w:%d %b}"))
-            parts.append(f'<div class="wk"><div class="row two">{"".join(figs)}</div>'
+        for wi, w in enumerate(weeks):
+            flick = "".join(anf(vi, wi, f"{label} \u2013 week of {w:%d %b}")
+                            for vi, (_, _, label) in enumerate(ANOMALY_MAPS))
+            sbs = "".join(
+                f'<h3>{esc(label)}</h3><div class="row">' +
+                "".join(anf(vi, wi, run_label(bt, True) + ("  (latest)" if bt == anom_bt else ""), ri)
+                        for ri, bt in enumerate(anom_history)) + '</div>'
+                for vi, (_, _, label) in enumerate(ANOMALY_MAPS))
+            parts.append(f'<div class="wk"><div class="row two an-flick">{flick}</div>'
+                         f'<div class="an-sbs">{sbs}</div>'
                          f'{notes_html(f"anom:{anom_bt:%Y%m%d%H}:{w:%Y%m%d}", f"Notes - week of {w:%a %d %b}")}</div>')
         parts.append('</div>')
-        # all weeks: one strip per variable
+        # all weeks: one strip per variable (shows the run selected above)
         parts.append('<div class="wk-all">')
-        for prod, proj, label in ANOMALY_MAPS:
-            figs = []
-            for w in weeks:
-                p = {"base_time": anom_bt, "projection": proj, "valid_time": w}
-                figs.append(figure_html(f"Week of {w:%d %b}", site_url(prod, p),
-                                        R[("anom", prod, w)], f"{label} {w:%d %b}"))
-            parts.append(f'<h3>{esc(label)}</h3><div class="strip">{"".join(figs)}</div>')
+        for vi, (_, _, label) in enumerate(ANOMALY_MAPS):
+            figs = "".join(anf(vi, wi, f"Week of {w:%d %b}") for wi, w in enumerate(weeks))
+            parts.append(f'<h3>{esc(label)}</h3><div class="strip">{figs}</div>')
         parts.append(notes_html(f"anom:{anom_bt:%Y%m%d%H}:all", "Notes - all weeks / overall"))
-        parts.append('</div></section>')
+        parts.append('</div>')
+
+        # chart data, stored once and placed into the figures by the page script
+        data = {"runs": [run_label(bt) for bt in anom_history], "cells": {}}
+        for vi, (prod, proj, _) in enumerate(ANOMALY_MAPS):
+            for wi, w in enumerate(weeks):
+                cell = []
+                for bt in anom_history:
+                    src, err, _ = R[("anom", prod, w, bt)]
+                    p = {"base_time": bt, "projection": proj, "valid_time": w}
+                    cell.append({"s": src, "e": err, "l": site_url(prod, p)})
+                data["cells"][f"{vi}|{wi}"] = cell
+        parts.append('<script type="application/json" id="anom-data">'
+                     + json.dumps(data).replace("</", "<\\/") + '</script>')
+        parts.append('</section>')
 
     # Hovmollers
     parts.append('<section id="hov"><h2>Hovmöller diagrams')
@@ -693,7 +776,7 @@ def build_html(ctx, R):
 </header>
 <main>
 <div class="tab" id="tab-met">{meteogram_tab(ctx["met_latest"], ctx["met_history"], R)}</div>
-<div class="tab" id="tab-ext">{extended_tab(ctx["anom_bt"], ctx["weeks"], ctx["hov_latest"], ctx["hov_history"], R)}</div>
+<div class="tab" id="tab-ext">{extended_tab(ctx["anom_bt"], ctx["weeks"], ctx["anom_history"], ctx["hov_latest"], ctx["hov_history"], R)}</div>
 <div class="tab" id="tab-strat">{strat_tab(ctx["strat_bts"], R)}</div>
 </main>
 <footer>Charts &copy; ECMWF, licensed under CC BY 4.0 &middot; charts.ecmwf.int</footer>
@@ -741,7 +824,14 @@ def main():
 
     anom_bt = find_latest("Weekly anomalies", recent_runs(EXTENDED_STEP_HOURS, 7),
                           lambda bt: anom_ok(bt, mondays_after(bt)[2]))
-    weeks = [w for w in mondays_after(anom_bt) if anom_ok(anom_bt, w)] if anom_bt else []
+    weeks = []
+    for w in (mondays_after(anom_bt) if anom_bt else []):
+        if len(weeks) >= ANOMALY_WEEKS:
+            break
+        if anom_ok(anom_bt, w):
+            weeks.append(w)
+    anom_history = ([anom_bt - timedelta(hours=EXTENDED_STEP_HOURS * i) for i in range(max(1, ANOMALY_HISTORY))][::-1]
+                    if anom_bt else [])
     if anom_bt:
         print(f"  Weekly anomalies: {len(weeks)} weeks ({', '.join(f'{w:%d %b}' for w in weeks)})")
 
@@ -764,9 +854,10 @@ def main():
                 jobs[("met", name, eg, met_latest)] = ("opencharts_meteogram", met_params(met_latest, eg, name, lat, lon))
         for bt in met_history:
             jobs[("met", name, HISTORY_PRODUCT, bt)] = ("opencharts_meteogram", met_params(bt, HISTORY_PRODUCT, name, lat, lon))
-    for w in weeks:
-        for prod, proj, _ in ANOMALY_MAPS:
-            jobs[("anom", prod, w)] = (prod, {"base_time": anom_bt, "projection": proj, "valid_time": w})
+    for bt in anom_history:
+        for w in weeks:
+            for prod, proj, _ in ANOMALY_MAPS:
+                jobs[("anom", prod, w, bt)] = (prod, {"base_time": bt, "projection": proj, "valid_time": w})
     for i, (params, _) in enumerate(HOVMOLLERS):
         for bt in hov_history:
             jobs[("hov", i, bt)] = (HOVMOLLER_PRODUCT, dict(params, base_time=bt))
@@ -785,7 +876,7 @@ def main():
             desc = " ".join(f"{x:%d %b %HZ}" if isinstance(x, datetime) else str(x) for x in k)
             print(f"  {desc:<60} {status}")
 
-    ctx = dict(met_latest=met_latest, met_history=met_history, anom_bt=anom_bt, weeks=weeks,
+    ctx = dict(met_latest=met_latest, met_history=met_history, anom_bt=anom_bt, weeks=weeks, anom_history=anom_history,
                hov_latest=hov_latest, hov_history=hov_history, strat_bts=strat_bts)
     stamp = (met_latest or datetime.now(timezone.utc)).strftime("%Y%m%d%H")
     out = Path(args.out or f"ens_grams_{stamp}.html").resolve()
