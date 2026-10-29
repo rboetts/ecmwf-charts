@@ -150,6 +150,82 @@ def http_get(url):
     return body, headers.get("Content-Type", "")
 
 
+# Some sites don't send their "intermediate" certificate. Browsers fetch it
+# automatically (from the address written in the site's certificate); this does
+# the same, and the full chain is still checked against the trusted roots.
+_SSL_CTX = {}
+
+
+def _aia_issuer_urls(der):
+    out, marker, i = [], b"\x06\x08\x2b\x06\x01\x05\x05\x07\x30\x02\x86", 0   # id-ad-caIssuers, URI
+    while True:
+        i = der.find(marker, i)
+        if i < 0:
+            return out
+        j = i + len(marker)
+        n, j = der[j], j + 1
+        if n & 0x80:                          # long-form length
+            k = n & 0x7F
+            n, j = int.from_bytes(der[j:j + k], "big"), j + k
+        out.append(der[j:j + n].decode("ascii", "replace"))
+        i += len(marker)
+
+
+def _der_tlv(b, i):
+    """(tag, start of value, end of value) for the DER element at i."""
+    tag, n, j = b[i], b[i + 1], i + 2
+    if n & 0x80:
+        k = n & 0x7F
+        n, j = int.from_bytes(b[j:j + k], "big"), j + k
+    return tag, j, j + n
+
+
+def _issuer_subject(der):
+    _, s, _ = _der_tlv(der, 0)          # Certificate
+    _, i, _ = _der_tlv(der, s)          # TBSCertificate
+    if der[i] == 0xA0:                  # [0] version
+        i = _der_tlv(der, i)[2]
+    fields = []
+    for _ in range(5):                  # serial, signature alg, issuer, validity, subject
+        t, a, e = _der_tlv(der, i)
+        fields.append(der[i:e])
+        i = e
+    return fields[2], fields[4]
+
+
+def _ssl_context_for(host, port=443):
+    if host in _SSL_CTX:
+        return _SSL_CTX[host]
+    import socket
+    import ssl
+    peek = ssl.create_default_context()
+    peek.check_hostname = False
+    peek.verify_mode = ssl.CERT_NONE            # only to read the site's certificate, not to trust it
+    with socket.create_connection((host, port), timeout=TIMEOUT) as sock:
+        with peek.wrap_socket(sock, server_hostname=host) as ss:
+            leaf = ss.getpeercert(binary_form=True)
+    ctx = ssl.create_default_context()
+    # the fetched certificate must itself chain to a trusted root: never let it act as a root
+    ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    added = 0
+    for url in _aia_issuer_urls(leaf):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=HEADERS), timeout=TIMEOUT) as r:
+                der = r.read()
+            issuer, subject = _issuer_subject(der)
+            if issuer == subject:
+                continue                        # self-signed: refuse
+            ctx.load_verify_locations(cadata=ssl.DER_cert_to_PEM_cert(der))
+            added += 1
+        except Exception:
+            continue
+    if not added:
+        raise RuntimeError(f"{host}: certificate chain incomplete and the missing certificate could not be fetched")
+    print(f"    {host}: fetched the site's missing intermediate certificate")
+    _SSL_CTX[host] = ctx
+    return ctx
+
+
 def http_get_full(url):
     """GET with polite pacing, and retries with back-off on 429 / busy server."""
     for attempt in range(MAX_RETRIES + 1):
@@ -160,8 +236,17 @@ def http_get_full(url):
             _last_request[0] = time.monotonic()
         try:
             req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-                return r.read(), r.headers
+            parts = urllib.parse.urlsplit(url)
+            host, port = parts.hostname, parts.port or 443
+            try:
+                with urllib.request.urlopen(req, timeout=TIMEOUT, context=_SSL_CTX.get(host)) as r:
+                    return r.read(), r.headers
+            except urllib.error.URLError as e:
+                if "CERTIFICATE_VERIFY_FAILED" not in str(e) or host in _SSL_CTX:
+                    raise
+                ctx = _ssl_context_for(host, port)
+                with urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx) as r:
+                    return r.read(), r.headers
         except urllib.error.HTTPError as e:
             if e.code not in (429, 502, 503, 504) or attempt == MAX_RETRIES:
                 raise
