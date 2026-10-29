@@ -58,8 +58,8 @@ METEOGRAMS = [
     ("classical_10d", "10-day ENS meteogram"),
     ("classical_15d", "15-day ENS meteogram"),
 ]
-HISTORY_PRODUCT = "classical_15d"  # meteogram used for the run-to-run comparison
-DEFAULT_HISTORY = 4                # meteogram runs to compare, incl. the latest (12 h apart)
+
+DEFAULT_HISTORY = 4                # meteogram runs to compare (10- and 15-day), incl. the latest (12 h apart)
 
 # Weekly mean anomaly maps: (product, projection, label)
 ANOMALY_MAPS = [
@@ -99,7 +99,7 @@ TELE_SETS = [
         {"label": "CPC AAO index \u2013 observed & GEFS forecast", "kind": "static",
          "url": CPC + "/precip/CWlink/daily_ao_index/aao/aao.gefs.sprd2.png", "crop": [0, 0, 1, 0.29]},
         {"label": "BoM SAM daily index outlook", "kind": "dated", "lookback": 35,
-         "url": "https://www.bom.gov.au/clim_data/IDCK000080/sam_index.daily.{date}.png",
+         "url": "https://www.bom.gov.au/clim_data/IDCK000080/sam_index.daily.{date}.png", "max_age_days": 10,
          "page": "https://www.bom.gov.au/climate/ocean/outlooks/?index=samL#tabs=Graphs"},
     ]},
     {"id": "mjo", "title": "MJO", "history": 2, "items": [
@@ -130,7 +130,7 @@ STRAT_SETS = [
 
 API = "https://charts.ecmwf.int/opencharts-api/v1/products/{product}/"
 SITE = "https://charts.ecmwf.int/products/{product}"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ens-grams-script/1.7; personal chart viewer)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ens-grams-script/2.0; personal chart viewer)"}
 TIMEOUT = 60
 REQUEST_GAP = 1.5      # seconds between requests to ECMWF (raise if you still see 429s)
 MAX_RETRIES = 4        # retries per request after "too many requests" / busy server
@@ -247,35 +247,6 @@ def fetch(product, params):
         return None, f"{type(e).__name__}: {e}", False
 
 
-def split_sets(sets, folder):
-    folder.mkdir(parents=True, exist_ok=True)
-    for sid, st in sets.items():
-        for i, it in enumerate(st["items"]):
-            for k, v in enumerate(it["v"]):
-                if v["s"] and v["s"].startswith("data:"):
-                    head, b64 = v["s"].split(",", 1)
-                    img = base64.b64decode(b64)
-                    name = "x_" + hashlib.sha1(img).hexdigest()[:16] + {"image/gif": ".gif", "image/jpeg": ".jpg"}.get(head[5:].split(";")[0], ".png")
-                    (folder / name).write_bytes(img)
-                    v["s"] = f"{folder.name}/{name}"
-
-
-def split_images(R, folder):
-    """Write embedded images out as files; the page then links to charts/<name>."""
-    folder.mkdir(parents=True, exist_ok=True)
-    ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg"}
-    out = {}
-    for key, (src, err, cached) in R.items():
-        if src and src.startswith("data:"):
-            head, b64 = src.split(",", 1)
-            ctype = head[5:].split(";")[0]
-            name = hashlib.sha1(repr(key).encode()).hexdigest()[:16] + ext.get(ctype, ".png")
-            (folder / name).write_bytes(base64.b64decode(b64))
-            src = f"{folder.name}/{name}"
-        out[key] = (src, err, cached)
-    return out
-
-
 # --------------------------------------------------------------------------
 # Charts from other sites (CPC, BoM, StratObserve)
 # --------------------------------------------------------------------------
@@ -327,7 +298,10 @@ def fetch_static_versions(item, n):
         err = f"{type(e).__name__}: {e}"
     # keep only what is needed
     keep = index[-max(n, 1):]
+    in_use = {e["file"] for e in keep}
     for old in index[:-max(n, 1)]:
+        if old["file"] in in_use:
+            continue
         try:
             (ARCHIVE_DIR / old["file"]).unlink()
         except OSError:
@@ -344,7 +318,7 @@ def fetch_static_versions(item, n):
         lab = ("updated " if ent.get("from_header") else "fetched ") + f"{t:%a %d %b %H:%M} UTC"
         try:
             src = _data_uri((ARCHIVE_DIR / ent["file"]).read_bytes(), ent.get("type"))
-            versions.append({"s": src, "e": None, "lab": lab, "l": item.get("page", item["url"])})
+            versions.append({"s": src, "e": None, "lab": lab, "l": item.get("page", item["url"]), "t": ent["time"]})
         except OSError as e:
             versions.append({"s": None, "e": str(e), "lab": lab, "l": item.get("page", item["url"])})
     if err and versions:
@@ -383,7 +357,7 @@ def fetch_dated_versions(item, n):
                 except OSError:
                     pass
             versions.append({"s": _data_uri(img, _sniff(img)), "e": None,
-                             "lab": f"issued {d:%a %d %b}", "l": item.get("page", url)})
+                             "lab": f"issued {d:%a %d %b}", "l": item.get("page", url), "t": d.isoformat()})
         except urllib.error.HTTPError as e:
             last_err = f"HTTPError {e.code}"
             if e.code == 404 and back > 3:      # old dates never appear later
@@ -410,7 +384,8 @@ def collect_sets(sets):
             versions, err = fn(it, st["history"])
             got = sum(1 for v in versions if v["s"])
             print(f"  {st['id']:<9} {it['label'][:44]:<46} {got} version(s)" + (f"  [{err}]" if err else ""))
-            items.append({"label": it["label"], "crop": it.get("crop"), "v": versions})
+            items.append({"label": it["label"], "crop": it.get("crop"), "v": versions,
+                          "max_age_days": it.get("max_age_days", 4)})
         out[st["id"]] = {"title": st["title"], "n": st["history"], "items": items}
     return out
 
@@ -461,639 +436,588 @@ def run_label(bt, short=False):
 
 
 # --------------------------------------------------------------------------
-# HTML
+# Page
 # --------------------------------------------------------------------------
-CSS = """
-:root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#5b6470; --line:#dde1e6; --accent:#1f5fa8; }
+# Python builds a small "model" of tabs > sections > charts > versions; the
+# page script turns it into the page. Every section works the same way.
+
+CSS = r"""
+:root { --bg:#f5f6f8; --card:#fff; --ink:#1b1f24; --muted:#5d6672; --line:#dde1e6; --accent:#1f5fa8; --accent-ink:#fff;
+        --ok:#1e7b34; --warn:#a15c00; --bad:#b3261e; --chip:#eef1f5; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#15181c; --card:#1e2227; --ink:#e6e9ed; --muted:#9aa3ad; --line:#2d333a; --accent:#6ea8ec; }
+  :root { --bg:#14171b; --card:#1d2126; --ink:#e6e9ed; --muted:#9aa3ad; --line:#2d333a; --accent:#6ea8ec; --accent-ink:#0d1117;
+          --ok:#5cc87a; --warn:#f0b357; --bad:#ff8a80; --chip:#262b31; }
 }
 * { box-sizing:border-box; }
-body { margin:0; font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
-header { position:sticky; top:0; z-index:5; background:var(--card); border-bottom:1px solid var(--line); padding:10px 16px 0; }
-.top { display:flex; flex-wrap:wrap; gap:4px 20px; align-items:baseline; }
-header h1 { font-size:17px; margin:0; }
-header .meta { color:var(--muted); font-size:13px; }
-.tabs { display:flex; gap:2px; margin-top:8px; flex-wrap:wrap; }
-.tabs button { font:inherit; font-size:14px; padding:7px 14px; border:0; border-bottom:3px solid transparent;
-               background:transparent; color:var(--muted); cursor:pointer; }
+html { -webkit-text-size-adjust:100%; }
+body { margin:0; font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink);
+       --col:460px; --col-all:360px; }
+body.size-s { --col:330px; --col-all:260px; }
+body.size-l { --col:680px; --col-all:520px; }
+button { font:inherit; color:inherit; }
+
+/* header */
+header { position:sticky; top:0; z-index:20; background:var(--card); border-bottom:1px solid var(--line); }
+.hrow { display:flex; align-items:center; gap:8px 12px; padding:8px 16px 0; flex-wrap:wrap; }
+.hrow h1 { font-size:16px; margin:0; letter-spacing:.2px; }
+.status { border:1px solid var(--line); background:var(--chip); border-radius:999px; padding:2px 10px; font-size:12.5px; cursor:pointer; }
+.status .short { display:none; }
+.status.ok b { color:var(--ok); } .status.warn b { color:var(--warn); }
+.hright { margin-left:auto; display:flex; gap:6px; align-items:center; }
+.seg { display:inline-flex; border:1px solid var(--line); border-radius:999px; overflow:hidden; }
+.seg button { border:0; background:transparent; padding:3px 9px; font-size:12.5px; cursor:pointer; }
+.seg button.on { background:var(--accent); color:var(--accent-ink); }
+.btn { border:1px solid var(--line); background:transparent; border-radius:999px; padding:3px 10px; font-size:12.5px; cursor:pointer; }
+.tabs { display:flex; gap:2px; padding:0 10px; overflow-x:auto; scrollbar-width:none; }
+.tabs::-webkit-scrollbar { display:none; }
+.tabs button { border:0; background:transparent; padding:8px 10px 7px; border-bottom:3px solid transparent; color:var(--muted);
+               cursor:pointer; white-space:nowrap; font-size:14px; }
 .tabs button.on { color:var(--ink); border-bottom-color:var(--accent); font-weight:600; }
-.bar { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin:0 0 14px; }
-.bar .sep { width:1px; height:18px; background:var(--line); margin:0 4px; }
-.bar a, .bar button, .ctl button { font:inherit; font-size:13px; padding:4px 10px; border:1px solid var(--line); border-radius:999px;
-        background:transparent; color:var(--ink); text-decoration:none; cursor:pointer; }
-.bar button.on, .ctl button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
-main { padding:16px; max-width:1800px; margin:0 auto; }
-.tab { display:none; }
-body[data-tab=met] #tab-met, body[data-tab=ext] #tab-ext, body[data-tab=tele] #tab-tele, body[data-tab=strat] #tab-strat { display:block; }
-.rs { --col:440px; --sbs:400px; }
-.rs.size-s { --col:320px; --sbs:300px; }
-.rs.size-l { --col:640px; --sbs:560px; }
-.rs .rs-flick { grid-template-columns:repeat(auto-fill, min(var(--col), 100%)); }
-.rs .rs-sbs { display:none; }
-.rs.sbs .rs-sbs { display:block; }
-.rs.sbs .rs-flick { display:none; }
-.rs .rs-sbs .row { grid-template-columns:repeat(auto-fill, min(var(--sbs), 100%)); gap:12px; margin-bottom:14px; }
-.rs .when { display:block; font-size:12px; }
-#tab-strat > section:first-child .row.two { grid-template-columns:repeat(auto-fill, min(620px, 100%)); }
-section { margin-bottom:28px; scroll-margin-top:110px; }
-h2 { font-size:18px; margin:0 0 4px; }
-h3 { font-size:16px; margin:0 0 8px; }
-h3 small, h2 small { font-weight:400; color:var(--muted); font-size:13px; }
-.row { display:grid; grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); gap:12px; }
-.row.two { grid-template-columns:repeat(auto-fit,minmax(460px,1fr)); }
-figure { margin:0; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:6px; }
-figcaption { font-size:13px; color:var(--muted); margin-bottom:4px; display:flex; justify-content:space-between; gap:8px; }
-figcaption a { color:var(--accent); white-space:nowrap; }
-figure img { width:100%; height:auto; display:block; background:#fff; border-radius:4px; cursor:zoom-in; }
-.err { padding:40px 12px; text-align:center; color:#b3261e; font-size:13px; }
-.hint { color:var(--muted); font-size:13px; margin:0 0 12px; }
-/* meteogram view modes */
-.cmp { display:none; }
-#tab-met.only-10d .p-classical_10d, #tab-met.only-15d .p-classical_15d { grid-column:1/-1; }
-#tab-met.only-10d .p-classical_15d, #tab-met.only-15d .p-classical_10d { display:none; }
-#tab-met.compare .latest { display:none; }
-#tab-met.compare .cmp, #tab-ext .cmp { display:block; }
-#tab-met:not(.compare) .hint.cmp-hint { display:none; }
-/* run-comparison viewers */
-.ctl { display:flex; flex-wrap:wrap; gap:6px 10px; align-items:center; margin-bottom:8px; font-size:13px; }
-.ctl input[type=range] { flex:1; min-width:140px; accent-color:var(--accent); }
-.ctl .lab { font-weight:600; min-width:9em; }
-.flick figure { max-width:1100px; }
-.cmp .grid { display:none; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:10px; }
-.cmp.sbs .grid { display:grid; }
-.cmp.sbs .flick { display:none; }
-/* weekly anomalies */
-.wk-all { display:none; }
-#anoms.all .wk-one { display:none; }
-#anoms.all .wk-all { display:block; }
-.wk { display:none; }
-.wk.on { display:block; }
-/* chart sizes: fixed column widths per S / M / L, so panels never stretch to fill the screen */
-#tab-met { --col:520px; --flick:760px; }
-#tab-met.size-s { --col:380px; --flick:560px; }
-#tab-met.size-l { --col:760px; --flick:1100px; }
-#anoms { --col:460px; --strip:240px; --sbs:420px; }
-#anoms.size-s { --col:320px; --strip:180px; --sbs:300px; }
-#anoms.size-l { --col:680px; --strip:340px; --sbs:600px; }
-#anoms .an-sbs { display:none; }
-#anoms.sbs .an-sbs { display:block; }
-#anoms.sbs .an-flick { display:none; }
-#anoms .an-sbs .row { grid-template-columns:repeat(auto-fill, min(var(--sbs), 100%)); gap:12px; margin-bottom:14px; }
-#an-ctl { margin-top:4px; }
-#hov { --col:560px; }
-#hov.size-s { --col:400px; }
-#hov.size-l { --col:820px; }
-#tab-met .row, #anoms .row.two, #hov .row.two { grid-template-columns:repeat(auto-fill, min(var(--col), 100%)); }
-#tab-met .cmp .grid { grid-template-columns:repeat(auto-fill, min(var(--col), 100%)); }
-#tab-met .flick figure { max-width:var(--flick); }
-#anoms .strip { grid-template-columns:repeat(auto-fill,minmax(min(var(--strip),100%),1fr)); }
-#hov .flick figure { max-width:none; }
-#tab-met.only-10d .p-classical_10d, #tab-met.only-15d .p-classical_15d { grid-column:auto; }
-/* notes */
-.notes { margin:12px 0 4px; }
+#problems { display:none; padding:6px 16px 10px; font-size:13px; border-top:1px solid var(--line); max-height:40vh; overflow:auto; }
+#problems.open { display:block; }
+#problems li { margin:2px 0; } #problems a { color:var(--accent); cursor:pointer; }
+
+/* tab body */
+main { padding:12px 16px 24px; max-width:1900px; margin:0 auto; }
+.jump { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin:0 0 12px; font-size:13px; }
+.jump a, .chip { border:1px solid var(--line); background:var(--card); border-radius:999px; padding:3px 10px; font-size:13px;
+                 cursor:pointer; color:var(--ink); text-decoration:none; white-space:nowrap; }
+.chip.on { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
+.jump .sp { flex:1; }
+section.sec { background:transparent; margin:0 0 18px; scroll-margin-top:96px; }
+.shead { display:flex; align-items:baseline; gap:8px; cursor:pointer; user-select:none; padding:4px 0; }
+.shead h2 { font-size:17px; margin:0; }
+.shead small { color:var(--muted); font-size:12.5px; font-weight:400; }
+.shead .chev { width:18px; color:var(--muted); transition:transform .15s; display:inline-block; }
+section.collapsed .chev { transform:rotate(-90deg); }
+section.collapsed .sbody { display:none; }
+.bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:4px 0 10px; }
+.bar .gap { width:10px; }
+.bar .lab { color:var(--muted); font-size:12.5px; margin-right:2px; }
+.bar .right { margin-left:auto; }
+.grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fill, min(var(--col), 100%)); }
+.rowh { font-size:14px; margin:10px 0 6px; font-weight:600; }
+.grid.all { grid-template-columns:repeat(auto-fill, min(var(--col-all), 100%)); }
+figure { margin:0; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:6px; min-width:0; }
+figcaption { display:flex; gap:8px; justify-content:space-between; align-items:baseline; font-size:13px; margin:0 2px 4px; }
+figcaption .t { font-weight:600; } figcaption .v { color:var(--muted); font-size:12px; display:block; font-weight:400; }
+figcaption a { color:var(--muted); text-decoration:none; font-size:13px; padding:0 2px; }
+figure img { display:block; width:100%; height:auto; border-radius:4px; background:#fff; cursor:zoom-in; }
+.miss { display:flex; align-items:center; justify-content:center; text-align:center; min-height:120px; padding:12px;
+        color:var(--muted); font-size:13px; background:var(--chip); border-radius:4px; }
+.miss.bad { color:var(--bad); }
+.hint { color:var(--muted); font-size:12.5px; margin:6px 0 0; }
+.notes { margin:12px 0 0; }
 .notes label { display:flex; justify-content:space-between; font-size:13px; font-weight:600; margin-bottom:4px; }
-.notes label .saved { font-weight:400; color:var(--muted); }
-.notes textarea { width:100%; min-height:90px; resize:vertical; font:inherit; font-size:14px; line-height:1.45;
-  padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); }
-.notes textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
-.savebtn { margin-left:auto; font:inherit; font-size:13px; padding:4px 10px; border:1px solid var(--line); border-radius:999px;
-  background:transparent; color:var(--ink); cursor:pointer; }
-.wk-all .strip { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:8px; margin-bottom:18px; }
-#zoom { position:fixed; inset:0; background:rgba(0,0,0,.85); display:none; align-items:center; justify-content:center; z-index:10; cursor:zoom-out; }
-#zoom img { max-width:98vw; max-height:98vh; background:#fff; }
-footer { color:var(--muted); font-size:12px; padding:0 16px 24px; text-align:center; }
-@media (max-width:520px) { .row, .row.two, .cmp .grid { grid-template-columns:1fr; } }
+.notes .saved { font-weight:400; color:var(--muted); }
+.notes textarea { width:100%; min-height:80px; resize:vertical; font:inherit; font-size:14px; padding:8px 10px;
+                  border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); }
+.hide-d10 .it-d10, .hide-d15 .it-d15 { display:none; }
+
+/* full-screen viewer */
+#lb { position:fixed; inset:0; z-index:50; background:#0b0d10; color:#eef1f4; display:none; flex-direction:column; }
+#lb.open { display:flex; }
+#lb .top { display:flex; align-items:center; gap:10px; padding:8px 12px; }
+#lb .ttl { font-weight:600; font-size:14px; } #lb .sub { color:#a8b0ba; font-size:12.5px; }
+#lb .x { margin-left:auto; }
+#lb button { background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.18); color:#eef1f4; border-radius:999px;
+             padding:4px 11px; font-size:13px; cursor:pointer; }
+#lb button.on { background:#eef1f4; color:#111; }
+#lb .stage { flex:1; overflow:auto; display:flex; align-items:center; justify-content:center; touch-action:pan-x pan-y pinch-zoom; }
+#lb .stage img { max-width:100%; max-height:100%; background:#fff; cursor:zoom-in; }
+#lb.zoom .stage { align-items:flex-start; justify-content:flex-start; }
+#lb.zoom .stage img { max-width:none; max-height:none; cursor:zoom-out; }
+#lb .bot { display:flex; gap:6px; align-items:center; justify-content:center; flex-wrap:wrap; padding:8px 12px 12px; }
+#lb .miss { background:transparent; color:#a8b0ba; }
+footer { color:var(--muted); font-size:12px; text-align:center; padding:4px 16px 20px; }
+
 @media (max-width:600px) {
-  header { padding:6px 12px 0; }
-  header h1 { font-size:15px; }
-  header .meta { font-size:12px; }
-  .savebtn { padding:3px 8px; font-size:12px; }
-  .tabs { margin-top:4px; flex-wrap:nowrap; overflow-x:auto; }
-  .tabs button { padding:6px 10px; font-size:13px; white-space:nowrap; }
-  main { padding:12px; }
+  .hrow { padding:6px 12px 0; } .hrow h1 { font-size:15px; }
+  .hright .lab { display:none; }
+  .status .full { display:none; } .status .short { display:inline; }
+  main { padding:10px 10px 20px; }
+  .shead h2 { font-size:16px; }
+  section.sec { scroll-margin-top:90px; }
 }
 """
 
 JS = r"""
-const body = document.body, met = document.getElementById('tab-met');
-function setTab(t) {
-  body.dataset.tab = t;
-  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
-  try { localStorage.setItem('ensTab', t); } catch (e) {}
+const M = JSON.parse(document.getElementById('model').textContent);
+const IMG = M.imgs;
+const $ = (s, el = document) => el.querySelector(s), $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('mc:' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem('mc:' + k, JSON.stringify(v)); } catch (e) {} }
+};
+const h = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === 'class') e.className = v; else if (k.startsWith('on')) e[k] = v; else e.setAttribute(k, v === true ? '' : v);
+  }
+  kids.flat().forEach(c => { if (c !== null && c !== undefined && c !== false) e.append(c.nodeType ? c : document.createTextNode(c)); });
+  return e;
+};
+
+// ---- state -------------------------------------------------------------
+const SEC = {};        // id -> {def, tab, ver, page, mode, timer, el}
+const GROUP = {};      // sync group -> [section ids]
+M.tabs.forEach(t => t.sections.forEach(s => {
+  SEC[s.id] = { def: s, tab: t.id, ver: 0, page: 0, mode: 'one', timer: null, el: null };
+  if (s.sync) (GROUP[s.sync] = GROUP[s.sync] || []).push(s.id);
+}));
+const collapsed = new Set(store.get('collapsed', []));
+const savedNotes = (() => { try { return JSON.parse(document.getElementById('saved-notes').textContent || '{}'); } catch (e) { return {}; } })();
+
+function peers(id) { const g = SEC[id].def.sync; return g ? GROUP[g] : [id]; }
+function nver(s) { return s.def.versions.length; }
+function items(s) { return s.def.pages[s.page].items; }
+
+// ---- charts --------------------------------------------------------------
+function chart(s, itemIdx, k, opts = {}) {
+  const it = items(s)[itemIdx], v = it.v[k];
+  const sub = v && v.lab ? v.lab : (s.def.versions[k] ? s.def.versions[k].long : '');
+  const cap = h('figcaption', {},
+    h('span', {}, h('span', { class: 't' }, opts.title || it.label), h('span', { class: 'v' }, sub)),
+    v && v.l ? h('a', { href: v.l, target: '_blank', rel: 'noopener', title: 'Open at the source' }, '↗') : null);
+  let body;
+  if (v && v.i !== null && v.i !== undefined) {
+    body = h('img', { src: IMG[v.i], alt: it.label, loading: 'lazy', 'data-crop': it.crop || null });
+    body.onclick = () => openLB(s.def.id, itemIdx, k);
+  } else {
+    const msg = !v ? 'No earlier version saved yet' : 'Not available' + (v.e ? ': ' + v.e : '');
+    body = h('div', { class: 'miss' + (k === 0 ? ' bad' : '') }, msg);
+  }
+  return h('figure', { class: it.cls ? 'it-' + it.cls : null }, cap, body);
 }
-document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => setTab(b.dataset.tab));
-try { const t = localStorage.getItem('ensTab'); if (t && document.getElementById('tab-' + t)) setTab(t); } catch (e) {}
 
-document.querySelectorAll('#met-modes button').forEach(b => b.onclick = () => {
-  met.classList.remove('only-10d', 'only-15d', 'compare');
-  if (b.dataset.mode !== 'both') met.classList.add(b.dataset.mode);
-  document.querySelectorAll('#met-modes button').forEach(x => x.classList.toggle('on', x === b));
-});
-
-// run-comparison viewers; viewers sharing data-group move together
-const groups = {};
-document.querySelectorAll('.cmp[data-runs]').forEach(v => {
-  const g = v.dataset.group;
-  (groups[g] = groups[g] || {viewers: [], idx: 0, n: 0, timer: null}).viewers.push(v);
-  v._runs = JSON.parse(v.dataset.runs);
-  groups[g].n = v._runs.length; groups[g].idx = v._runs.length - 1;
-});
-function show(g, i) {
-  const G = groups[g]; if (!G || !G.n) return;
-  G.idx = (i + G.n) % G.n;
-  G.viewers.forEach(v => {
-    const r = v._runs[G.idx];
-    const img = v.querySelector('.flick img'), err = v.querySelector('.flick .err');
-    if (r.src) { img.src = r.src; img.style.display = ''; err.style.display = 'none'; }
-    else { img.style.display = 'none'; err.style.display = ''; err.textContent = 'Not available: ' + (r.err || ''); }
-    v.querySelector('.flick .lab').textContent = r.label + (G.idx === G.n - 1 ? '  (latest)' : '');
-    v.querySelector('.flick figcaption a').href = r.link;
-    v.querySelector('input[type=range]').value = G.idx;
-  });
-}
-Object.entries(groups).forEach(([g, G]) => {
-  G.viewers.forEach(v => {
-    v.querySelector('input[type=range]').oninput = e => show(g, +e.target.value);
-    v.querySelector('.prev').onclick = () => show(g, G.idx - 1);
-    v.querySelector('.next').onclick = () => show(g, G.idx + 1);
-    v.querySelector('.play').onclick = () => {
-      if (G.timer) { clearInterval(G.timer); G.timer = null; }
-      else G.timer = setInterval(() => show(g, G.idx + 1), 1200);
-      G.viewers.forEach(w => w.querySelector('.play').classList.toggle('on', !!G.timer));
-    };
-    v.querySelectorAll('.layout button').forEach(b => b.onclick = () => G.viewers.forEach(w => {
-      w.classList.toggle('sbs', b.dataset.lay === 'sbs');
-      w.querySelectorAll('.layout button').forEach(x => x.classList.toggle('on', x.dataset.lay === b.dataset.lay));
-    }));
-  });
-  show(g, G.n - 1);
-});
-// weekly anomaly maps: one run selector for every map
-const AN = (() => {
-  const el = document.getElementById('anom-data'); if (!el) return null;
-  const data = JSON.parse(el.textContent), n = data.runs.length;
-  const ctl = document.getElementById('an-ctl'), sec = document.getElementById('anoms');
-  const st = { idx: n - 1, n, timer: null };
-  function fill(fig, ri) {
-    const c = data.cells[fig.dataset.v + '|' + fig.dataset.w][ri];
-    const img = fig.querySelector('img'), err = fig.querySelector('.err');
-    if (c && c.s) {
-      if (img.dataset.orig !== c.s) { img.dataset.orig = c.s; img.src = c.s; }
-      img.style.display = ''; err.style.display = 'none';
-    } else {
-      img.style.display = 'none'; err.style.display = '';
-      err.textContent = 'Not available' + (c && c.e ? ': ' + c.e : '');
-    }
-    if (c) fig.querySelector('a').href = c.l;
-  }
-  function show(i) {
-    st.idx = (i + n) % n;
-    sec.querySelectorAll('.anf:not([data-r])').forEach(f => fill(f, st.idx));
-    ctl.querySelector('.lab').textContent = 'Run ' + data.runs[st.idx] + (st.idx === n - 1 ? '  (latest)' : '');
-    ctl.querySelector('input').value = st.idx;
-  }
-  sec.querySelectorAll('.anf[data-r]').forEach(f => fill(f, +f.dataset.r));
-  ctl.querySelector('input').oninput = e => show(+e.target.value);
-  ctl.querySelector('.prev').onclick = () => show(st.idx - 1);
-  ctl.querySelector('.next').onclick = () => show(st.idx + 1);
-  ctl.querySelector('.play').onclick = () => {
-    if (st.timer) { clearInterval(st.timer); st.timer = null; } else st.timer = setInterval(() => show(st.idx + 1), 1200);
-    ctl.querySelector('.play').classList.toggle('on', !!st.timer);
-  };
-  ctl.querySelectorAll('.layout button').forEach(b => b.onclick = () => {
-    sec.classList.toggle('sbs', b.dataset.lay === 'sbs');
-    ctl.querySelectorAll('.layout button').forEach(x => x.classList.toggle('on', x === b));
-  });
-  show(n - 1);
-  return { show, st };
-})();
-
-// run sets (Teleconnections / Stratosphere): one slider per set
-const RS = [...document.querySelectorAll('.rs')].map(sec => {
-  const data = JSON.parse(sec.querySelector('.rs-data').textContent), n = data.n;
-  const ctl = sec.querySelector('.rs-ctl');
-  const st = { sec, idx: n - 1, n, timer: null };       // slider: 0 = oldest, n-1 = latest
-  function fill(fig, k) {                                // k: 0 = latest, 1 = previous, ...
-    const v = data.items[+fig.dataset.i].v[k];
-    const img = fig.querySelector('img'), err = fig.querySelector('.err');
-    if (v && v.s) {
-      if (img.dataset.orig !== v.s) { img.dataset.orig = v.s; img.src = v.s; }
-      img.style.display = ''; err.style.display = 'none';
-    } else {
-      img.style.display = 'none'; err.style.display = '';
-      err.textContent = v ? 'Not available: ' + (v.e || '') : 'No earlier version saved yet';
-    }
-    fig.querySelector('.when').textContent = v ? (v.lab || '') : '';
-    if (v) fig.querySelector('a').href = v.l;
-  }
-  function show(i) {
-    st.idx = (i + n) % n;
-    const k = n - 1 - st.idx;
-    sec.querySelectorAll('.rs-flick .rsf').forEach(f => fill(f, k));
-    if (ctl) {
-      ctl.querySelector('.lab').textContent = k === 0 ? 'Latest' : k === 1 ? 'Previous' : k + ' versions back';
-      ctl.querySelector('input').value = st.idx;
-    }
-  }
-  sec.querySelectorAll('.rs-sbs .rsf').forEach(f => fill(f, +f.dataset.k));
-  if (ctl) {
-    ctl.querySelector('input').oninput = e => show(+e.target.value);
-    ctl.querySelector('.prev').onclick = () => show(st.idx - 1);
-    ctl.querySelector('.next').onclick = () => show(st.idx + 1);
-    ctl.querySelector('.play').onclick = () => {
-      if (st.timer) { clearInterval(st.timer); st.timer = null; } else st.timer = setInterval(() => show(st.idx + 1), 1200);
-      ctl.querySelector('.play').classList.toggle('on', !!st.timer);
-    };
-    ctl.querySelectorAll('.layout button').forEach(b => b.onclick = () => {
-      sec.classList.toggle('sbs', b.dataset.lay === 'sbs');
-      ctl.querySelectorAll('.layout button').forEach(x => x.classList.toggle('on', x === b));
+function renderGrid(id) {
+  const s = SEC[id], box = $('.charts', s.el); box.innerHTML = '';
+  if (s.mode === 'one' || nver(s) < 2) {
+    box.append(h('div', { class: 'grid' }, items(s).map((_, i) => chart(s, i, s.ver))));
+  } else {
+    items(s).forEach((it, i) => {
+      const row = h('div', { class: it.cls ? 'it-' + it.cls : null }, h('div', { class: 'rowh' }, it.label),
+        h('div', { class: 'grid all' }, [...Array(nver(s)).keys()].reverse().map(k =>
+          chart(s, i, k, { title: s.def.versions[k].short }))));
+      box.append(row);
     });
   }
-  show(n - 1);
-  st.show = show;
-  return st;
-});
-function activeRunset() {      // the set nearest the top of the screen in the current tab
-  const tab = document.getElementById('tab-' + body.dataset.tab);
-  let best = null;
-  RS.forEach(r => {
-    if (!tab || !tab.contains(r.sec) || r.n < 2) return;
-    const t = r.sec.getBoundingClientRect().top;
-    if (t < innerHeight / 2 && (!best || t > best.t)) best = { r, t };
+  // version + mode buttons
+  $$('.vbtn', s.el).forEach(b => b.classList.toggle('on', +b.dataset.k === s.ver && s.mode === 'one'));
+  $$('.mbtn', s.el).forEach(b => b.classList.toggle('on', b.dataset.m === s.mode));
+  $$('.pbtn', s.el).forEach(b => b.classList.toggle('on', +b.dataset.p === s.page));
+  const play = $('.play', s.el); if (play) play.classList.toggle('on', !!s.timer);
+  renderNotes(id);
+}
+
+function setVer(id, k, fromPlay) {
+  peers(id).forEach(pid => {
+    const p = SEC[pid]; if (!fromPlay && p.timer) stopPlay(pid);
+    p.ver = Math.max(0, Math.min(nver(p) - 1, k)); p.mode = 'one'; if (p.el) renderGrid(pid);
   });
-  return best ? best.r : null;
+}
+function setMode(id, m) { peers(id).forEach(pid => { SEC[pid].mode = m; stopPlay(pid); if (SEC[pid].el) renderGrid(pid); }); }
+function stopPlay(id) { const s = SEC[id]; if (s.timer) { clearInterval(s.timer); s.timer = null; } }
+function togglePlay(id) {
+  const s = SEC[id];
+  if (s.timer) { peers(id).forEach(stopPlay); renderGrid(id); return; }
+  let k = nver(s) - 1; setVer(id, k);
+  s.timer = setInterval(() => { k = k <= 0 ? nver(s) - 1 : k - 1; setVer(id, k, true); }, 1300);
+  renderGrid(id);
 }
 
-function activeGroup() {
-  if (body.dataset.tab === 'met' && met.classList.contains('compare')) return 'met';
-  if (body.dataset.tab === 'ext') {
-    const hov = document.getElementById('hov');
-    if (!AN || (hov && hov.getBoundingClientRect().top < innerHeight / 2)) return 'hov';
-    return 'anom';
+// ---- notes -------------------------------------------------------------
+function renderNotes(id) {
+  const s = SEC[id], box = $('.notesbox', s.el); if (!box) return;
+  const n = s.def.pages[s.page].notes || s.def.notes;
+  box.innerHTML = '';
+  if (!n) return;
+  const key = 'notes:' + n.key;
+  const ta = h('textarea', { placeholder: 'Your thoughts…' });
+  let legacy = null; try { legacy = localStorage.getItem('ensnotes:' + n.key); } catch (e) {}
+  ta.value = store.get(key, null) ?? (legacy || null) ?? savedNotes[n.key] ?? '';
+  const saved = h('span', { class: 'saved' });
+  let tm;
+  ta.oninput = () => { clearTimeout(tm); tm = setTimeout(() => {
+    store.set(key, ta.value); savedNotes[n.key] = ta.value; saved.textContent = 'saved';
+    setTimeout(() => saved.textContent = '', 1500); }, 400); };
+  box.append(h('div', { class: 'notes' }, h('label', {}, h('span', {}, n.title), saved), ta));
+}
+
+// ---- sections & tabs -----------------------------------------------------
+function buildSection(sd) {
+  const s = SEC[sd.id];
+  const bar = h('div', { class: 'bar' });
+  if (sd.pages.length > 1) {
+    sd.pages.forEach((p, i) => bar.append(h('button', { class: 'chip pbtn', 'data-p': i,
+      onclick: () => { s.page = i; renderGrid(sd.id); } }, p.label)));
+    bar.append(h('span', { class: 'gap' }));
   }
-  if (body.dataset.tab === 'tele' || body.dataset.tab === 'strat') return 'rs';
-  return null;
-}
-
-// weekly anomaly week picker
-const anoms = document.getElementById('anoms');
-if (anoms) {
-  const btns = [...anoms.querySelectorAll('.wkbtn')], weeks = [...anoms.querySelectorAll('.wk')];
-  function pickWeek(i) {
-    anoms.classList.toggle('all', i === 'all');
-    btns.forEach(b => b.classList.toggle('on', b.dataset.wk === String(i)));
-    weeks.forEach((w, j) => w.classList.toggle('on', j === i));
+  if (sd.versions.length > 1) {
+    bar.append(h('span', { class: 'lab' }, 'Run'));
+    sd.versions.forEach((v, k) => bar.append(h('button', { class: 'chip vbtn', 'data-k': k, title: v.long,
+      onclick: () => setVer(sd.id, k) }, v.short)));
+    bar.append(h('button', { class: 'chip play', title: 'Play through the runs', onclick: () => togglePlay(sd.id) }, '▶'));
+    bar.append(h('span', { class: 'seg right' },
+      h('button', { class: 'mbtn', 'data-m': 'one', onclick: () => setMode(sd.id, 'one') }, 'One run'),
+      h('button', { class: 'mbtn', 'data-m': 'all', onclick: () => setMode(sd.id, 'all') }, 'All runs')));
   }
-  btns.forEach(b => b.onclick = () => pickWeek(b.dataset.wk === 'all' ? 'all' : +b.dataset.wk));
-  if (weeks.length) pickWeek(0);
+  const head = h('div', { class: 'shead', onclick: () => {
+      el.classList.toggle('collapsed');
+      if (el.classList.contains('collapsed')) collapsed.add(sd.id); else collapsed.delete(sd.id);
+      store.set('collapsed', [...collapsed]); } },
+    h('span', { class: 'chev' }, '▾'), h('h2', {}, sd.title), sd.sub ? h('small', {}, sd.sub) : null);
+  const el = h('section', { class: 'sec' + (collapsed.has(sd.id) ? ' collapsed' : ''), id: sd.id }, head,
+    h('div', { class: 'sbody' }, bar.childNodes.length ? bar : null, h('div', { class: 'charts' }),
+      sd.hint ? h('p', { class: 'hint' }, sd.hint) : null, h('div', { class: 'notesbox' })));
+  s.el = el;
+  renderGrid(sd.id);
+  return el;
 }
 
-// S / M / L size pickers (each remembered)
-document.querySelectorAll('.sizer').forEach(sp => {
-  const target = document.getElementById(sp.dataset.target); if (!target) return;
-  const set = sz => {
-    target.classList.remove('size-s', 'size-l');
-    if (sz !== 'm') target.classList.add('size-' + sz);
-    sp.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.size === sz));
-    try { localStorage.setItem('ensSize:' + sp.dataset.target, sz); } catch (e) {}
-  };
-  sp.querySelectorAll('button').forEach(b => b.onclick = () => set(b.dataset.size));
-  try { const sz = localStorage.getItem('ensSize:' + sp.dataset.target); if (sz) set(sz); } catch (e) {}
+function buildTab(t) {
+  const app = $('#app'); app.innerHTML = '';
+  app.className = '';
+  const jump = h('div', { class: 'jump' });
+  if (t.sections.length > 1) t.sections.forEach(sd => jump.append(h('a', { onclick: () => {
+    const el = document.getElementById(sd.id); el.classList.remove('collapsed'); collapsed.delete(sd.id);
+    store.set('collapsed', [...collapsed]); el.scrollIntoView({ behavior: 'smooth' }); } }, sd.title)));
+  if (t.filters) {
+    const f = store.get('filter:' + t.id, 0);
+    const seg = h('span', { class: 'seg' });
+    const apply = i => { app.classList.remove('hide-d10', 'hide-d15'); (t.filters[i].hide || []).forEach(c => app.classList.add('hide-' + c));
+      $$('button', seg).forEach((b, j) => b.classList.toggle('on', i === j)); store.set('filter:' + t.id, i); };
+    t.filters.forEach((fl, i) => seg.append(h('button', { onclick: () => apply(i) }, fl.label)));
+    jump.append(h('span', { class: 'gap' }), seg); setTimeout(() => apply(f));
+  }
+  if (t.sections.length > 1) {
+    jump.append(h('span', { class: 'sp' }),
+      h('a', { onclick: () => { t.sections.forEach(sd => { collapsed.add(sd.id); document.getElementById(sd.id).classList.add('collapsed'); }); store.set('collapsed', [...collapsed]); } }, 'Collapse all'),
+      h('a', { onclick: () => { t.sections.forEach(sd => { collapsed.delete(sd.id); document.getElementById(sd.id).classList.remove('collapsed'); }); store.set('collapsed', [...collapsed]); } }, 'Expand all'));
+  }
+  if (jump.childNodes.length) app.append(jump);
+  t.sections.forEach(sd => app.append(buildSection(sd)));
+}
+
+let curTab = null;
+function setTab(id, then) {
+  Object.values(SEC).forEach(s => { stopPlay(s.def.id); s.el = null; });
+  curTab = M.tabs.find(t => t.id === id) || M.tabs[0];
+  $$('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.t === curTab.id));
+  buildTab(curTab); store.set('tab', curTab.id);
+  window.scrollTo(0, 0);
+  if (then) setTimeout(then, 30);
+}
+
+// ---- header ----------------------------------------------------------------
+function buildHeader() {
+  const tabs = $('.tabs');
+  M.tabs.forEach(t => tabs.append(h('button', { 'data-t': t.id, onclick: () => setTab(t.id) }, t.title)));
+  const st = $('.status'), probs = M.problems;
+  st.className = 'status ' + (probs.length ? 'warn' : 'ok');
+  st.innerHTML = '';
+  st.append(h('b', {}, probs.length ? '⚠ ' + probs.length + (probs.length === 1 ? ' issue' : ' issues') : '✓'),
+    ' ', h('span', { class: 'full' }, M.count + ' charts · ' + M.built), h('span', { class: 'short' }, M.count + ' · ' + M.built_short));
+  const box = $('#problems');
+  if (probs.length) {
+    const ul = h('ul', { style: 'margin:0;padding-left:18px' });
+    probs.forEach(p => ul.append(h('li', {}, h('a', { onclick: () => { box.classList.remove('open');
+      setTab(p.tab, () => { const el = document.getElementById(p.sec); if (el) { el.classList.remove('collapsed'); el.scrollIntoView(); } }); } }, p.where), ': ' + p.what)));
+    box.append(ul);
+    st.onclick = () => box.classList.toggle('open');
+  } else st.title = 'Everything fetched and up to date';
+  const size = store.get('size', 'm'), seg = $('#size');
+  const setSize = z => { document.body.classList.remove('size-s', 'size-l'); if (z !== 'm') document.body.classList.add('size-' + z);
+    $$('button', seg).forEach(b => b.classList.toggle('on', b.dataset.z === z)); store.set('size', z); };
+  $$('button', seg).forEach(b => b.onclick = () => setSize(b.dataset.z)); setSize(size);
+  $('#savecopy').onclick = saveCopy;
+}
+
+// ---- full-screen viewer ----------------------------------------------------
+const LB = { sec: null, item: 0, k: 0 };
+function openLB(secId, item, k) { Object.assign(LB, { sec: secId, item, k }); $('#lb').classList.add('open'); $('#lb').classList.remove('zoom'); drawLB(); }
+function closeLB() { $('#lb').classList.remove('open'); }
+function drawLB() {
+  const s = SEC[LB.sec], its = items(s), it = its[LB.item], v = it.v[LB.k], n = nver(s);
+  $('#lb .ttl').textContent = it.label;
+  $('#lb .sub').textContent = (s.def.versions[LB.k] ? s.def.versions[LB.k].short + ' · ' : '') + (v && v.lab ? v.lab : (s.def.versions[LB.k] || {}).long || '');
+  const stage = $('#lb .stage'); stage.innerHTML = '';
+  if (v && v.i !== null && v.i !== undefined) {
+    const img = h('img', { src: IMG[v.i], alt: it.label, 'data-crop': it.crop || null });
+    img.onclick = () => $('#lb').classList.toggle('zoom');
+    stage.append(img);
+  } else stage.append(h('div', { class: 'miss' }, 'Not available' + (v && v.e ? ': ' + v.e : '')));
+  const bot = $('#lb .bot'); bot.innerHTML = '';
+  if (its.length > 1) bot.append(h('button', { onclick: () => stepItem(-1), title: 'Previous chart (↑)' }, '‹ Chart'));
+  if (n > 1) [...Array(n).keys()].reverse().forEach(k => bot.append(h('button', { class: k === LB.k ? 'on' : null,
+    onclick: () => { LB.k = k; drawLB(); } }, s.def.versions[k].short)));
+  if (its.length > 1) bot.append(h('button', { onclick: () => stepItem(1), title: 'Next chart (↓)' }, 'Chart ›'));
+}
+function stepVer(d) { const n = nver(SEC[LB.sec]); LB.k = Math.max(0, Math.min(n - 1, LB.k - d)); drawLB(); }   // d=+1 newer
+function stepItem(d) { const n = items(SEC[LB.sec]).length; LB.item = (LB.item + d + n) % n; drawLB(); }
+(() => {
+  let x0 = null, y0 = null;
+  const st = () => $('#lb .stage');
+  document.addEventListener('touchstart', e => { if (!$('#lb').classList.contains('open') || e.touches.length > 1) { x0 = null; return; }
+    x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
+  document.addEventListener('touchend', e => { if (x0 === null || $('#lb').classList.contains('zoom')) return;
+    const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0; x0 = null;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > 1.5 * Math.abs(dy)) stepVer(dx < 0 ? 1 : -1);
+    else if (Math.abs(dy) > 70 && Math.abs(dy) > 1.5 * Math.abs(dx)) stepItem(dy < 0 ? 1 : -1); }, { passive: true });
+})();
+
+// ---- keyboard ------------------------------------------------------------
+function nearestSection() {
+  let best = null;
+  Object.values(SEC).forEach(s => { if (!s.el || nver(s) < 2 || s.el.classList.contains('collapsed')) return;
+    const t = s.el.getBoundingClientRect().top; if (t < innerHeight / 2 && (!best || t > best.t)) best = { s, t }; });
+  return best ? best.s : null;
+}
+document.addEventListener('keydown', e => {
+  if (e.target.matches('textarea, input')) return;
+  if ($('#lb').classList.contains('open')) {
+    if (e.key === 'Escape') closeLB();
+    if (e.key === 'ArrowLeft') stepVer(-1); if (e.key === 'ArrowRight') stepVer(1);
+    if (e.key === 'ArrowUp') { e.preventDefault(); stepItem(-1); } if (e.key === 'ArrowDown') { e.preventDefault(); stepItem(1); }
+    return;
+  }
+  const s = nearestSection(); if (!s) return;
+  if (e.key === 'ArrowLeft') setVer(s.def.id, s.ver + 1);
+  if (e.key === 'ArrowRight') setVer(s.def.id, s.ver - 1);
 });
 
-// trim white margins off meteograms (done in the browser, once per image)
-const TRIM_SELECTOR = '#tab-met figure img, #anoms figure img, #hov figure img, #tab-tele figure img, #tab-strat figure img';
-const trimmed = new Map();              // original src -> trimmed src
-const trimmedSet = new Set();
+// ---- crop + trim white margins (in the browser, once per image) ------------
+const trimmed = new Map(), trimmedSet = new Set();
 function trim(img) {
   const src = img.currentSrc || img.src;
   if (!src || trimmedSet.has(src)) return;
-  if (trimmed.has(src)) { img.src = trimmed.get(src); return; }
-  const fig = img.closest('figure'), cr = fig && fig.dataset.crop ? fig.dataset.crop.split(',').map(Number) : null;
-  const W = img.naturalWidth, H = img.naturalHeight;
-  if (!W || !H) return;
+  const cr = img.dataset.crop ? img.dataset.crop.split(',').map(Number) : null;
+  const key = src + (cr ? '#' + cr : '');
+  if (trimmed.has(key)) { img.src = trimmed.get(key); return; }
+  const W = img.naturalWidth, H = img.naturalHeight; if (!W || !H) return;
   const sx = cr ? Math.round(cr[0] * W) : 0, sy = cr ? Math.round(cr[1] * H) : 0;
-  const w = cr ? Math.round((cr[2] - cr[0]) * W) : W, h = cr ? Math.round((cr[3] - cr[1]) * H) : H;
-  const c = document.createElement('canvas'); c.width = w; c.height = h;
-  const cx = c.getContext('2d'); cx.drawImage(img, sx, sy, w, h, 0, 0, w, h);
-  let d; try { d = cx.getImageData(0, 0, w, h).data; } catch (e) { return; }
+  const w = cr ? Math.round((cr[2] - cr[0]) * W) : W, hh = cr ? Math.round((cr[3] - cr[1]) * H) : H;
+  const c = document.createElement('canvas'); c.width = w; c.height = hh;
+  const cx = c.getContext('2d'); cx.drawImage(img, sx, sy, w, hh, 0, 0, w, hh);
+  let d; try { d = cx.getImageData(0, 0, w, hh).data; } catch (e) { trimmedSet.add(src); return; }
   const blank = (x, y) => { const i = (y * w + x) * 4; return d[i + 3] < 10 || (d[i] > 245 && d[i + 1] > 245 && d[i + 2] > 245); };
   const rowBlank = y => { for (let x = 0; x < w; x += 2) if (!blank(x, y)) return false; return true; };
-  const colBlank = (x, y0, y1) => { for (let y = y0; y <= y1; y += 2) if (!blank(x, y)) return false; return true; };
-  let top = 0, bot = h - 1, left = 0, right = w - 1;
-  while (top < bot && rowBlank(top)) top++;
-  while (bot > top && rowBlank(bot)) bot--;
-  while (left < right && colBlank(left, top, bot)) left++;
-  while (right > left && colBlank(right, top, bot)) right--;
-  const pad = 6;
-  top = Math.max(0, top - pad); left = Math.max(0, left - pad);
-  bot = Math.min(h - 1, bot + pad); right = Math.min(w - 1, right + pad);
-  const cw = right - left + 1, ch = bot - top + 1;
-  if (!cr && cw * ch > 0.97 * w * h) { trimmedSet.add(src); return; }   // nothing worth trimming
+  const colBlank = (x, a, b) => { for (let y = a; y <= b; y += 2) if (!blank(x, y)) return false; return true; };
+  let t = 0, b = hh - 1, l = 0, r = w - 1;
+  while (t < b && rowBlank(t)) t++; while (b > t && rowBlank(b)) b--;
+  while (l < r && colBlank(l, t, b)) l++; while (r > l && colBlank(r, t, b)) r--;
+  t = Math.max(0, t - 6); l = Math.max(0, l - 6); b = Math.min(hh - 1, b + 6); r = Math.min(w - 1, r + 6);
+  const cw = r - l + 1, ch = b - t + 1;
+  if (!cr && cw * ch > 0.97 * w * hh) { trimmedSet.add(src); return; }
   const o = document.createElement('canvas'); o.width = cw; o.height = ch;
-  o.getContext('2d').drawImage(c, left, top, cw, ch, 0, 0, cw, ch);
+  o.getContext('2d').drawImage(c, l, t, cw, ch, 0, 0, cw, ch);
   const out = o.toDataURL('image/png');
-  trimmed.set(src, out); trimmedSet.add(out);
-  img.src = out;
+  trimmed.set(key, out); trimmedSet.add(out); img.src = out;
 }
-document.addEventListener('load', e => {
-  if (e.target.tagName === 'IMG' && e.target.matches(TRIM_SELECTOR)) trim(e.target);
-}, true);
-document.querySelectorAll(TRIM_SELECTOR).forEach(img => { if (img.complete) trim(img); });
+document.addEventListener('load', e => { if (e.target.tagName === 'IMG') trim(e.target); }, true);
 
-// notes: auto-saved in this browser; "Save copy with notes" writes them into a downloadable page
-document.querySelectorAll('.notes textarea').forEach(t => {
-  const key = 'ensnotes:' + t.dataset.key, saved = t.closest('.notes').querySelector('.saved');
-  try { const v = localStorage.getItem(key); if (v !== null && v !== '') t.value = v; } catch (e) {}
-  let tm;
-  t.addEventListener('input', () => {
-    clearTimeout(tm);
-    tm = setTimeout(() => {
-      try { localStorage.setItem(key, t.value); saved.textContent = 'saved'; }
-      catch (e) { saved.textContent = 'not saved - use "Save copy with notes"'; }
-      setTimeout(() => { if (saved.textContent === 'saved') saved.textContent = ''; }, 1500);
-    }, 400);
-  });
-});
-document.getElementById('savecopy').onclick = () => {
+// ---- save a copy with notes ------------------------------------------------
+function saveCopy() {
   const doc = document.documentElement.cloneNode(true);
-  doc.querySelectorAll('img[src]').forEach(i => {        // keep image links working in the copy
-    const a = i.getAttribute('src'); if (a && !a.startsWith('data:')) i.setAttribute('src', new URL(a, location.href).href);
-  });
-  const live = document.querySelectorAll('.notes textarea');
-  doc.querySelectorAll('.notes textarea').forEach((t, i) => { t.textContent = live[i].value; });
-  doc.querySelectorAll('.saved').forEach(s => s.textContent = '');
-  doc.querySelector('#zoom').style.display = 'none';
-  const html = '<!doctype html>\n' + doc.outerHTML;
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([html], {type: 'text/html'}));
-  const name = (location.pathname.split('/').pop() || 'ens_grams.html').replace(/(_notes)?\.html?$/i, '');
-  a.download = name + '_notes.html';
-  document.body.appendChild(a); a.click(); a.remove();
-};
+  $('#app', doc).innerHTML = ''; $('.tabs', doc).innerHTML = ''; $('#problems', doc).innerHTML = '';
+  $('#lb .stage', doc).innerHTML = '';
+  const model = JSON.parse(JSON.stringify(M));
+  model.imgs = model.imgs.map(u => u.startsWith('data:') ? u : new URL(u, location.href).href);
+  $('#model', doc).textContent = JSON.stringify(model).replace(/<\//g, '<\\/');
+  const notes = Object.assign({}, savedNotes);
+  M.tabs.forEach(t => t.sections.forEach(s => [s.notes, ...s.pages.map(p => p.notes)].forEach(n => {
+    if (n) { const v = store.get('notes:' + n.key, null); if (v !== null) notes[n.key] = v; } })));
+  $('#saved-notes', doc).textContent = JSON.stringify(notes).replace(/<\//g, '<\\/');
+  const a = h('a', { download: (location.pathname.split('/').pop() || 'met_charts.html').replace(/(_notes)?\.html?$/i, '').replace(/^$/, 'met_charts') + '_notes.html' });
+  a.href = URL.createObjectURL(new Blob(['<!doctype html>\n' + doc.outerHTML], { type: 'text/html' }));
+  document.body.append(a); a.click(); a.remove();
+}
 
-const z = document.getElementById('zoom');
-document.addEventListener('click', e => {
-  if (e.target.matches('figure img')) { z.firstElementChild.src = e.target.src; z.style.display = 'flex'; }
-});
-z.onclick = () => z.style.display = 'none';
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { z.style.display = 'none'; return; }
-  if (e.target.matches('textarea, input')) return;
-  const g = activeGroup(); if (!g) return;
-  const step = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0; if (!step) return;
-  if (g === 'rs') { const r = activeRunset(); if (r) r.show(r.idx + step); }
-  else if (g === 'anom') AN.show(AN.st.idx + step); else show(g, groups[g].idx + step);
-});
+// ---- go --------------------------------------------------------------------
+buildHeader();
+$('#lb .x').onclick = closeLB;
+setTab(store.get('tab', M.tabs[0].id));
 """
 
-
-def esc(s):
-    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;"))
-
-
-def figure_html(label, link, res, alt, cls=""):
-    src, err = res[0], res[1]
-    body = (f'<img loading="lazy" src="{src}" alt="{esc(alt)}">' if src
-            else f'<div class="err">Could not fetch this chart<br>{esc(err or "")}</div>')
-    return (f'<figure class="{cls}"><figcaption><span>{esc(label)}</span>'
-            f'<a href="{esc(link)}" target="_blank" rel="noopener">open on ECMWF</a></figcaption>'
-            f'{body}</figure>')
-
-
-def sizer(target):
-    return (f'<span class="sizer" data-target="{target}" style="display:contents">'
-            f'<button data-size="s" title="Small">S</button><button data-size="m" class="on" title="Medium">M</button>'
-            f'<button data-size="l" title="Large">L</button></span>')
-
-
-def notes_html(key, title):
-    return (f'<div class="notes"><label><span>{esc(title)}</span><span class="saved"></span></label>'
-            f'<textarea data-key="{esc(key)}" placeholder="Your thoughts..."></textarea></div>')
-
-
-def viewer_html(group, title, runs, latest_bt):
-    """runs: list of (bt, link, result), oldest first."""
-    data = [{"label": run_label(bt), "src": r[0], "err": r[1], "link": link} for bt, link, r in runs]
-    grid = "".join(figure_html(run_label(bt, True) + ("  (latest)" if bt == latest_bt else ""),
-                               link, r, f"{title} {run_label(bt, True)}") for bt, link, r in runs)
-    return (
-        f'<div class="cmp" data-group="{group}" data-runs="{esc(json.dumps(data))}">'
-        f'<div class="flick"><div class="ctl">'
-        f'<button class="prev" title="Older run">&larr;</button>'
-        f'<input type="range" min="0" max="{len(runs) - 1}" step="1">'
-        f'<button class="next" title="Newer run">&rarr;</button>'
-        f'<button class="play">Play</button><span class="lab"></span>'
-        f'<span class="layout" style="margin-left:auto;display:flex;gap:6px">'
-        f'<button data-lay="flick" class="on">Flick</button><button data-lay="sbs">Side by side</button></span>'
-        f'</div><figure><figcaption><span>{esc(title)}</span>'
-        f'<a target="_blank" rel="noopener">open on ECMWF</a></figcaption>'
-        f'<img alt="{esc(title)}"><div class="err" style="display:none"></div></figure></div>'
-        f'<div class="grid">{"".join(grid)}</div></div>')
-
-
-def meteogram_tab(met_latest, met_history, R):
-    if met_latest is None:
-        return '<p class="err">No meteogram run found.</p>'
-    sections, nav = [], []
-    for name, lat, lon in STATIONS:
-        sid = "st-" + name.lower().replace(" ", "-")
-        nav.append(f'<a href="#{sid}">{esc(name)}</a>')
-        base = {"base_time": met_latest, "lat": f"{lat:.4f}", "lon": f"{lon:.4f}", "station_name": name}
-        figs = []
-        for eg, label in METEOGRAMS:
-            p = dict(base, epsgram=eg)
-            figs.append(figure_html(label, site_url("opencharts_meteogram", p),
-                                    R[("met", name, eg, met_latest)], f"{name} {label}", f"p-{eg}"))
-        runs = []
-        for bt in met_history:
-            p = dict(base, base_time=bt, epsgram=HISTORY_PRODUCT)
-            runs.append((bt, site_url("opencharts_meteogram", p), R[("met", name, HISTORY_PRODUCT, bt)]))
-        sections.append(
-            f'<section id="{sid}"><h3>{esc(name)} <small>{lat:.2f}, {lon:.2f}</small></h3>'
-            f'<div class="row latest">{"".join(figs)}</div>'
-            f'{viewer_html("met", "15-day ENS meteogram", runs, met_latest)}</section>')
-    return (
-        f'<div class="bar">{"".join(nav)}<span class="sep"></span><span id="met-modes" style="display:contents">'
-        f'<button data-mode="both" class="on">Both</button><button data-mode="only-10d">10-day</button>'
-        f'<button data-mode="only-15d">15-day</button><button data-mode="compare">Compare runs (15-day)</button></span>'
-        f'<span class="sep"></span>{sizer("tab-met")}</div>'
-        f'<p class="meta hint">Latest run {run_label(met_latest)}</p>'
-        f'<p class="hint cmp-hint">Comparing the last {len(met_history)} runs of the 15-day meteogram. Use the slider or '
-        f'&larr; / &rarr; keys to step through runs, or switch to side by side. Each run starts 12 h later, '
-        f'so the time axis shifts slightly between runs.</p>' + "\n".join(sections))
-
-
-def extended_tab(anom_bt, weeks, anom_history, hov_latest, hov_history, R):
-    parts = []
-    # weekly mean anomalies, with run-to-run comparison
-    parts.append('<section id="anoms"><h2>Weekly mean anomalies')
-    if anom_bt is None or not weeks:
-        parts.append('</h2><p class="err">No weekly anomaly charts found.</p></section>')
-    else:
-        parts.append(f' <small>latest run {run_label(anom_bt)}</small></h2>')
-        btns = "".join(f'<button class="wkbtn" data-wk="{i}">Week of {w:%a %d %b}</button>'
-                       for i, w in enumerate(weeks))
-        parts.append(f'<div class="bar">{btns}<span class="sep"></span>'
-                     f'<button class="wkbtn" data-wk="all">All weeks</button><span class="sep"></span>{sizer("anoms")}</div>')
-        nr = len(anom_history)
-        parts.append(
-            f'<div class="ctl" id="an-ctl"><button class="prev" title="Older run">&larr;</button>'
-            f'<input type="range" min="0" max="{nr - 1}" step="1" value="{nr - 1}">'
-            f'<button class="next" title="Newer run">&rarr;</button><button class="play">Play</button>'
-            f'<span class="lab"></span>'
-            f'<span class="layout" style="margin-left:auto;display:flex;gap:6px">'
-            f'<button data-lay="flick" class="on">Flick</button><button data-lay="sbs">Side by side</button></span></div>')
-        parts.append(f'<p class="hint">Last {nr} runs for the same weeks. All maps step together; '
-                     f'use the slider or &larr; / &rarr; keys, or Side by side to see the runs in a row.</p>')
-
-        def anf(vi, wi, caption, ri=None):
-            r = "" if ri is None else f' data-r="{ri}"'
-            return (f'<figure class="anf" data-v="{vi}" data-w="{wi}"{r}><figcaption><span>{esc(caption)}</span>'
-                    f'<a target="_blank" rel="noopener">open on ECMWF</a></figcaption>'
-                    f'<img alt="{esc(caption)}"><div class="err" style="display:none"></div></figure>')
-
-        # one week at a time
-        parts.append('<div class="wk-one">')
-        for wi, w in enumerate(weeks):
-            flick = "".join(anf(vi, wi, f"{label} \u2013 week of {w:%d %b}")
-                            for vi, (_, _, label) in enumerate(ANOMALY_MAPS))
-            sbs = "".join(
-                f'<h3>{esc(label)}</h3><div class="row">' +
-                "".join(anf(vi, wi, run_label(bt, True) + ("  (latest)" if bt == anom_bt else ""), ri)
-                        for ri, bt in enumerate(anom_history)) + '</div>'
-                for vi, (_, _, label) in enumerate(ANOMALY_MAPS))
-            parts.append(f'<div class="wk"><div class="row two an-flick">{flick}</div>'
-                         f'<div class="an-sbs">{sbs}</div>'
-                         f'{notes_html(f"anom:{anom_bt:%Y%m%d%H}:{w:%Y%m%d}", f"Notes - week of {w:%a %d %b}")}</div>')
-        parts.append('</div>')
-        # all weeks: one strip per variable (shows the run selected above)
-        parts.append('<div class="wk-all">')
-        for vi, (_, _, label) in enumerate(ANOMALY_MAPS):
-            figs = "".join(anf(vi, wi, f"Week of {w:%d %b}") for wi, w in enumerate(weeks))
-            parts.append(f'<h3>{esc(label)}</h3><div class="strip">{figs}</div>')
-        parts.append(notes_html(f"anom:{anom_bt:%Y%m%d%H}:all", "Notes - all weeks / overall"))
-        parts.append('</div>')
-
-        # chart data, stored once and placed into the figures by the page script
-        data = {"runs": [run_label(bt) for bt in anom_history], "cells": {}}
-        for vi, (prod, proj, _) in enumerate(ANOMALY_MAPS):
-            for wi, w in enumerate(weeks):
-                cell = []
-                for bt in anom_history:
-                    src, err, _ = R[("anom", prod, w, bt)]
-                    p = {"base_time": bt, "projection": proj, "valid_time": w}
-                    cell.append({"s": src, "e": err, "l": site_url(prod, p)})
-                data["cells"][f"{vi}|{wi}"] = cell
-        parts.append('<script type="application/json" id="anom-data">'
-                     + json.dumps(data).replace("</", "<\\/") + '</script>')
-        parts.append('</section>')
-
-    # Hovmollers
-    parts.append('<section id="hov"><h2>Hovmöller diagrams')
-    if hov_latest is None:
-        parts.append('</h2><p class="err">No Hovmöller run found.</p></section>')
-    else:
-        parts.append(f' <small>latest run {run_label(hov_latest)}</small></h2>'
-                     f'<div class="bar"><span class="hint" style="margin:0">Size</span>{sizer("hov")}</div>'
-                     f'<p class="hint">Last {len(hov_history)} runs. Both diagrams step together; '
-                     f'use the slider or &larr; / &rarr; keys.</p><div class="row two">')
-        for i, (params, label) in enumerate(HOVMOLLERS):
-            runs = []
-            for bt in hov_history:
-                p = dict(params, base_time=bt)
-                runs.append((bt, site_url(HOVMOLLER_PRODUCT, p), R[("hov", i, bt)]))
-            parts.append(f'<div>{viewer_html("hov", label, runs, hov_latest)}</div>')
-        parts.append('</div>')
-        parts.append(notes_html(f"hov:{hov_latest:%Y%m%d%H}", "Notes - Hovm\u00f6llers"))
-        parts.append('</section>')
-    return "\n".join(parts)
-
-
-def runset_html(sid, st):
-    """One run slider driving a set of charts (flick), or each chart's versions in a row (side by side)."""
-    n, items = st["n"], st["items"]
-    def fig(i, k=None):
-        it = items[i]
-        crop = f' data-crop="{",".join(str(c) for c in it["crop"])}"' if it.get("crop") else ""
-        kk = "" if k is None else f' data-k="{k}"'
-        return (f'<figure class="rsf" data-i="{i}"{kk}{crop}><figcaption><span>{esc(it["label"])}'
-                f'<span class="when"></span></span><a target="_blank" rel="noopener">source</a></figcaption>'
-                f'<img alt="{esc(it["label"])}"><div class="err" style="display:none"></div></figure>')
-    flick = "".join(fig(i) for i in range(len(items)))
-    sbs = "".join(f'<h3>{esc(it["label"])}</h3><div class="row">' +
-                  "".join(fig(i, k) for k in reversed(range(n))) + '</div>'
-                  for i, it in enumerate(items))
-    ctl = ""
-    if n > 1:
-        ctl = (f'<div class="ctl rs-ctl"><button class="prev" title="Older">&larr;</button>'
-               f'<input type="range" min="0" max="{n - 1}" step="1" value="{n - 1}">'
-               f'<button class="next" title="Newer">&rarr;</button><button class="play">Play</button>'
-               f'<span class="lab"></span><span class="layout" style="margin-left:auto;display:flex;gap:6px">'
-               f'<button data-lay="flick" class="on">Flick</button><button data-lay="sbs">Side by side</button></span></div>')
-    data = json.dumps({"n": n, "items": [{"v": it["v"]} for it in items]}).replace("</", "<\\/")
-    return (f'<section class="rs" id="rs-{sid}"><h2>{esc(st["title"])}</h2>'
-            f'<div class="bar"><span class="hint" style="margin:0">Size</span>{sizer("rs-" + sid)}</div>{ctl}'
-            f'<div class="row rs-flick">{flick}</div><div class="rs-sbs">{sbs}</div>'
-            f'<script type="application/json" class="rs-data">{data}</script></section>')
-
-
-def tele_tab(sets):
-    out = [runset_html(st["id"], sets[st["id"]]) for st in TELE_SETS if st["id"] in sets]
-    out.append('<p class="hint">Charts with a fixed web address (CPC) are overwritten by their site, so this page keeps its own '
-               'copies: "previous" versions build up over the first few days of running.</p>')
-    return "\n".join(out)
-
-
-def strat_tab(strat_bts, R, sets=None):
-    parts = ['<section><h2>ECMWF</h2><div class="row two">']
-    for i, (prod, params, label) in enumerate(STRAT_CHARTS):
-        bt = strat_bts[i]
-        if bt is None:
-            parts.append(f'<figure><figcaption>{esc(label)}</figcaption><div class="err">No run found.</div></figure>')
-            continue
-        p = dict(params, base_time=bt)
-        parts.append(figure_html(f"{label} – run {run_label(bt, True)}", site_url(prod, p),
-                                 R[("strat", i, bt)], label))
-    parts.append('</div></section>')
-    for st in STRAT_SETS:
-        if sets and st["id"] in sets:
-            parts.append(runset_html(st["id"], sets[st["id"]]))
-    return "\n".join(parts)
-
-
-def build_html(ctx, R):
-    title_run = ctx["met_latest"].strftime("%Y%m%d %HZ") if ctx["met_latest"] else ""
-    return f"""<!doctype html>
+PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ECMWF charts {title_run}</title>
-<style>{CSS}</style></head>
-<body data-tab="met">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1f5fa8">
+<title>Met charts</title>
+<style>__CSS__</style></head>
+<body>
 <header>
-  <div class="top"><h1>ECMWF charts</h1>
-  <span class="meta">built {datetime.now(LOCAL_TZ):%a %d %b %H:%M AEST}</span>
-  <button class="savebtn" id="savecopy" title="Download a copy of this page with your notes written into it">Save copy with notes</button></div>
-  <div class="tabs">
-    <button data-tab="met" class="on">Meteograms</button>
-    <button data-tab="ext">Extended Outlook</button>
-    <button data-tab="tele">Teleconnections</button>
-    <button data-tab="strat">Stratosphere</button>
+  <div class="hrow">
+    <h1>Met charts</h1>
+    <span class="status"></span>
+    <span class="hright">
+      <span class="lab" style="font-size:12.5px;color:var(--muted)">Size</span>
+      <span class="seg" id="size"><button data-z="s">S</button><button data-z="m">M</button><button data-z="l">L</button></span>
+      <button class="btn" id="savecopy" title="Download a copy of this page with your notes in it">Save notes</button>
+    </span>
   </div>
+  <div id="problems"></div>
+  <nav class="tabs"></nav>
 </header>
-<main>
-<div class="tab" id="tab-met">{meteogram_tab(ctx["met_latest"], ctx["met_history"], R)}</div>
-<div class="tab" id="tab-ext">{extended_tab(ctx["anom_bt"], ctx["weeks"], ctx["anom_history"], ctx["hov_latest"], ctx["hov_history"], R)}</div>
-<div class="tab" id="tab-tele">{tele_tab(ctx["sets"])}</div>
-<div class="tab" id="tab-strat">{strat_tab(ctx["strat_bts"], R, ctx["sets"])}</div>
-</main>
-<footer>Charts &copy; ECMWF, licensed under CC BY 4.0 &middot; charts.ecmwf.int</footer>
-<div id="zoom"><img alt=""></div>
-<script>{JS}</script>
+<main id="app"></main>
+<footer>Charts &copy; ECMWF (CC BY 4.0), NOAA CPC, Bureau of Meteorology, StratObserve. Tap a chart for full screen.</footer>
+<div id="lb"><div class="top"><div><div class="ttl"></div><div class="sub"></div></div><button class="x">Close ✕</button></div>
+<div class="stage"></div><div class="bot"></div></div>
+<script type="application/json" id="model">__MODEL__</script>
+<script type="application/json" id="saved-notes">{}</script>
+<script>__JS__</script>
 </body></html>
 """
+
+
+def _ago_label(bt, latest, step_h):
+    if bt == latest:
+        return "Latest"
+    hrs = int(round((latest - bt).total_seconds() / 3600))
+    return f"−{hrs // 24} d" if step_h >= 24 and hrs % 24 == 0 else f"−{hrs} h"
+
+
+def build_model(ctx, R):
+    now = datetime.now(timezone.utc)
+    imgs, index = [], {}
+
+    def reg(src):
+        if src not in index:
+            index[src] = len(imgs)
+            imgs.append(src)
+        return index[src]
+
+    def V(res, link, lab=None):
+        src, err = res[0], res[1]
+        return {"i": reg(src) if src else None, "e": None if src else err, "l": link, "lab": lab}
+
+    def run_versions(runs, step_h):            # runs newest first
+        return [{"short": _ago_label(bt, runs[0], step_h), "long": run_label(bt)} for bt in runs]
+
+    problems = []
+
+    def check(tab, sec, title, its, latest_time=None, max_age_h=None):
+        for it in its:
+            v0 = it["v"][0] if it["v"] else None
+            if not v0 or v0["i"] is None:
+                problems.append({"tab": tab, "sec": sec, "where": f"{title} · {it['label']}",
+                                 "what": "not fetched" + (f" ({v0['e']})" if v0 and v0.get("e") else "")})
+        if latest_time and max_age_h and (now - latest_time).total_seconds() / 3600 > max_age_h:
+            problems.append({"tab": tab, "sec": sec, "where": title,
+                             "what": f"latest run is {run_label(latest_time, True)} (older than expected)"})
+
+    tabs = []
+
+    # Meteograms -------------------------------------------------------------
+    secs = []
+    hist = list(reversed(ctx["met_history"]))           # newest first
+    if hist:
+        for name, lat, lon in STATIONS:
+            base = {"lat": f"{lat:.4f}", "lon": f"{lon:.4f}", "station_name": name}
+            its = []
+            for eg, label in METEOGRAMS:
+                its.append({"label": label, "cls": "d10" if "10d" in eg else "d15", "v": [
+                    V(R[("met", name, eg, bt)], site_url("opencharts_meteogram", dict(base, base_time=bt, epsgram=eg)))
+                    for bt in hist]})
+            sid = "st-" + name.lower().replace(" ", "-")
+            check("met", sid, name, its, hist[0], 36)
+            secs.append({"id": sid, "title": name, "sub": f"{lat:.2f}, {lon:.2f}", "sync": "met",
+                         "versions": run_versions(hist, 12), "pages": [{"label": None, "items": its}]})
+    tabs.append({"id": "met", "title": "Meteograms", "sections": secs,
+                 "filters": [{"label": "Both"}, {"label": "10-day", "hide": ["d15"]}, {"label": "15-day", "hide": ["d10"]}]})
+
+    # Extended Outlook -------------------------------------------------------
+    secs = []
+    ahist = list(reversed(ctx["anom_history"]))
+    weeks, abt = ctx["weeks"], ctx["anom_bt"]
+    if abt and weeks:
+        def cell(prod, proj, w, label):
+            return {"label": label, "v": [V(R[("anom", prod, w, bt)],
+                    site_url(prod, {"base_time": bt, "projection": proj, "valid_time": w})) for bt in ahist]}
+        pages = []
+        for w in weeks:
+            pages.append({"label": f"{w:%d %b}", "items": [cell(p, pr, w, lab) for p, pr, lab in ANOMALY_MAPS],
+                          "notes": {"key": f"anom:{abt:%Y%m%d%H}:{w:%Y%m%d}", "title": f"Notes – week of {w:%a %d %b}"}})
+        pages.append({"label": "All weeks",
+                      "items": [cell(p, pr, w, f"{lab} · wk {w:%d %b}") for p, pr, lab in ANOMALY_MAPS for w in weeks],
+                      "notes": {"key": f"anom:{abt:%Y%m%d%H}:all", "title": "Notes – all weeks"}})
+        for pg in pages[:-1]:
+            check("ext", "anoms", f"Weekly anomalies · week of {pg['label']}", pg["items"])
+        check("ext", "anoms", "Weekly anomalies", [], ahist[0], 60)
+        secs.append({"id": "anoms", "title": "Weekly mean anomalies", "sub": "week starting (Monday)",
+                     "versions": run_versions(ahist, 24), "pages": pages})
+    hhist = list(reversed(ctx["hov_history"]))
+    if hhist:
+        its = [{"label": label, "v": [V(R[("hov", i, bt)], site_url(HOVMOLLER_PRODUCT, dict(params, base_time=bt)))
+                                      for bt in hhist]} for i, (params, label) in enumerate(HOVMOLLERS)]
+        check("ext", "hov", "Hovmöllers", its, hhist[0], 60)
+        secs.append({"id": "hov", "title": "Hovmöller diagrams", "sub": "Southern Hemisphere",
+                     "versions": run_versions(hhist, 24), "pages": [{"label": None, "items": its}],
+                     "notes": {"key": f"hov:{hhist[0]:%Y%m%d%H}", "title": "Notes – Hovmöllers"}})
+    tabs.append({"id": "ext", "title": "Extended Outlook", "sections": secs})
+
+    # Teleconnections + Stratosphere (sets from other sites) -------------------
+    def set_section(tab, sid, st):
+        n = st["n"]
+        names = ["Latest", "Previous"] + [f"{k} back" for k in range(2, n)]
+        its = []
+        for it in st["items"]:
+            vs = [{"i": reg(v["s"]) if v["s"] else None, "e": None if v["s"] else v["e"], "l": v["l"], "lab": v["lab"]}
+                  for v in it["v"]]
+            its.append({"label": it["label"], "crop": ",".join(str(c) for c in it["crop"]) if it.get("crop") else None, "v": vs})
+            t0 = it["v"][0].get("t") if it["v"] else None
+            if t0:
+                age_d = (now - datetime.fromisoformat(t0)).total_seconds() / 86400
+                if age_d > it.get("max_age_days", 4):
+                    problems.append({"tab": tab, "sec": sid, "where": f"{st['title']} · {it['label']}",
+                                     "what": f"latest is {age_d:.0f} days old"})
+        check(tab, sid, st["title"], its)
+        return {"id": sid, "title": st["title"], "versions": [{"short": names[k], "long": names[k]} for k in range(n)],
+                "pages": [{"label": None, "items": its}],
+                "hint": "Previous versions of CPC charts are saved by this page, so they build up over the first few days."
+                        if any(x.get("kind") == "static" for x in next(s for s in TELE_SETS + STRAT_SETS if s["id"] == sid)["items"]) else None}
+
+    sets = ctx["sets"]
+    tabs.append({"id": "tele", "title": "Teleconnections",
+                 "sections": [set_section("tele", st["id"], sets[st["id"]]) for st in TELE_SETS if st["id"] in sets]})
+    secs = []
+    sits = []
+    for i, (prod, params, label) in enumerate(STRAT_CHARTS):
+        bt = ctx["strat_bts"][i]
+        if bt:
+            sits.append({"label": label, "v": [V(R[("strat", i, bt)], site_url(prod, dict(params, base_time=bt)), f"run {run_label(bt, True)}")]})
+            check("strat", "ecmwf-strat", "ECMWF", sits[-1:], bt, 60)
+        else:
+            sits.append({"label": label, "v": [{"i": None, "e": "no recent run found", "l": None, "lab": None}]})
+            check("strat", "ecmwf-strat", "ECMWF", sits[-1:])
+    secs.append({"id": "ecmwf-strat", "title": "ECMWF", "versions": [{"short": "Latest", "long": "Latest"}],
+                 "pages": [{"label": None, "items": sits}]})
+    secs += [set_section("strat", st["id"], sets[st["id"]]) for st in STRAT_SETS if st["id"] in sets]
+    tabs.append({"id": "strat", "title": "Stratosphere", "sections": secs})
+
+    return {"tabs": tabs, "imgs": imgs, "problems": problems, "count": len(imgs),
+            "built": datetime.now(LOCAL_TZ).strftime("built %a %d %b %H:%M AEST"),
+            "built_short": datetime.now(LOCAL_TZ).strftime("%a %H:%M")}
+
+
+def split_model(model, folder):
+    """Write embedded images out as files; the page then links to charts/<name>."""
+    folder.mkdir(parents=True, exist_ok=True)
+    ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+    for i, src in enumerate(model["imgs"]):
+        if src.startswith("data:"):
+            head, b64 = src.split(",", 1)
+            img = base64.b64decode(b64)
+            name = hashlib.sha1(img).hexdigest()[:16] + ext.get(head[5:].split(";")[0], ".png")
+            (folder / name).write_bytes(img)
+            model["imgs"][i] = f"{folder.name}/{name}"
+
+
+def build_html(model):
+    data = json.dumps(model, separators=(",", ":")).replace("</", "<\\/")
+    return PAGE.replace("__CSS__", CSS).replace("__JS__", JS).replace("__MODEL__", data)
 
 
 # --------------------------------------------------------------------------
@@ -1163,7 +1087,8 @@ def main():
             for eg, _ in METEOGRAMS:
                 jobs[("met", name, eg, met_latest)] = ("opencharts_meteogram", met_params(met_latest, eg, name, lat, lon))
         for bt in met_history:
-            jobs[("met", name, HISTORY_PRODUCT, bt)] = ("opencharts_meteogram", met_params(bt, HISTORY_PRODUCT, name, lat, lon))
+            for eg, _ in METEOGRAMS:
+                jobs[("met", name, eg, bt)] = ("opencharts_meteogram", met_params(bt, eg, name, lat, lon))
     for bt in anom_history:
         for w in weeks:
             for prod, proj, _ in ANOMALY_MAPS:
@@ -1194,12 +1119,14 @@ def main():
     stamp = (met_latest or datetime.now(timezone.utc)).strftime("%Y%m%d%H")
     out = Path(args.out or f"ens_grams_{stamp}.html").resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
+    model = build_model(ctx, R)
     if args.split:
-        R = split_images(R, out.parent / "charts")
-        split_sets(sets, out.parent / "charts")
-    out.write_text(build_html(ctx, R), encoding="utf-8")
+        split_model(model, out.parent / "charts")
+    out.write_text(build_html(model), encoding="utf-8")
     ok = sum(1 for v in R.values() if v[0])
-    print(f"Wrote {out}  ({ok}/{len(R)} charts)")
+    print(f"Wrote {out}  ({model['count']} charts, {len(model['problems'])} issue(s))")
+    for pr in model["problems"]:
+        print(f"  ! {pr['where']}: {pr['what']}")
     if not args.no_open:
         webbrowser.open(out.as_uri())
     if ok == 0:
