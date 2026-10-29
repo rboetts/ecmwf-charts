@@ -86,9 +86,51 @@ STRAT_CHARTS = [
     ("extended-zonal-mean-zonal-wind", {"area": "sh"}, "Zonal-mean zonal wind, 10 hPa (SH)"),
 ]
 
+# --- Charts from other sites ----------------------------------------------
+# Each set gets one run slider. "history" = how many versions to show (latest + previous).
+#   kind "static": the site always overwrites the same file, so previous versions are
+#                  kept by this script in ens_grams_cache/archive (history builds up over time).
+#   kind "dated":  the file name contains the date ({date} = YYYYMMDD); the script looks
+#                  back up to "lookback" days for the newest versions.
+#   crop: [x0, y0, x1, y1] as fractions of the image to keep (cropped in the browser).
+CPC = "https://www.cpc.ncep.noaa.gov/products"
+TELE_SETS = [
+    {"id": "sam", "title": "Southern Annular Mode", "history": 5, "items": [
+        {"label": "CPC AAO index \u2013 observed & GEFS forecast", "kind": "static",
+         "url": CPC + "/precip/CWlink/daily_ao_index/aao/aao.gefs.sprd2.png", "crop": [0, 0, 1, 0.29]},
+        {"label": "BoM SAM daily index outlook", "kind": "dated", "lookback": 35,
+         "url": "https://www.bom.gov.au/clim_data/IDCK000080/sam_index.daily.{date}.png",
+         "page": "https://www.bom.gov.au/climate/ocean/outlooks/?index=samL#tabs=Graphs"},
+    ]},
+    {"id": "mjo", "title": "MJO", "history": 2, "items": [
+        {"label": "EMON_BC (ECMWF, bias-corrected)", "kind": "static", "url": CPC + "/precip/mjo/img/EMON_BC.png"},
+        {"label": "GMON (NCEP GEFS)", "kind": "static", "url": CPC + "/precip/mjo/img/GMON.png"},
+        {"label": "BOMM_BC (BoM, bias-corrected)", "kind": "static", "url": CPC + "/precip/mjo/img/BOMM_BC.png"},
+    ]},
+]
+_SSW = CPC + "/stratosphere/SSW/gif_files/"
+STRAT_SETS = [
+    {"id": "cpcstrat", "title": "CPC polar-cap temperature and 60\u00b0S zonal wind", "history": 3, "items": [
+        {"label": "Temperature 90\u201360\u00b0S, 10 hPa", "kind": "static", "url": _SSW + "T_10mb_9060S.png"},
+        {"label": "Temperature 90\u201360\u00b0S, 50 hPa", "kind": "static", "url": _SSW + "T_50mb_9060S.png"},
+        {"label": "Temperature 90\u201360\u00b0S, 100 hPa", "kind": "static", "url": _SSW + "T_100mb_9060S.png"},
+        {"label": "Zonal wind 60\u00b0S, 10 hPa", "kind": "static", "url": _SSW + "U_10mb_60S.png"},
+        {"label": "Zonal wind 60\u00b0S, 50 hPa", "kind": "static", "url": _SSW + "U_50mb_60S.png"},
+        {"label": "Zonal wind 60\u00b0S, 100 hPa", "kind": "static", "url": _SSW + "U_100mb_60S.png"},
+    ]},
+    {"id": "stratobs", "title": "StratObserve anomaly time series (SH, 60\u00b0 zonal-mean zonal wind)", "history": 2, "items": [
+        {"label": "GFS", "kind": "dated", "lookback": 10,
+         "url": "https://stratobserve.com/plots/{date}/tseries/anoms/gfs_sh-u60_{date}.png",
+         "page": "https://stratobserve.com/anom_ts_diags"},
+        {"label": "GEOS", "kind": "dated", "lookback": 10,
+         "url": "https://stratobserve.com/plots/{date}/tseries/anoms/geos_sh-u60_{date}.png",
+         "page": "https://stratobserve.com/anom_ts_diags"},
+    ]},
+]
+
 API = "https://charts.ecmwf.int/opencharts-api/v1/products/{product}/"
 SITE = "https://charts.ecmwf.int/products/{product}"
-HEADERS = {"User-Agent": "ens-grams-script/1.6 (personal use)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ens-grams-script/1.7; personal chart viewer)"}
 TIMEOUT = 60
 REQUEST_GAP = 1.5      # seconds between requests to ECMWF (raise if you still see 429s)
 MAX_RETRIES = 4        # retries per request after "too many requests" / busy server
@@ -104,6 +146,11 @@ _lock = threading.Lock()
 
 
 def http_get(url):
+    body, headers = http_get_full(url)
+    return body, headers.get("Content-Type", "")
+
+
+def http_get_full(url):
     """GET with polite pacing, and retries with back-off on 429 / busy server."""
     for attempt in range(MAX_RETRIES + 1):
         with _lock:  # space requests out, even across threads
@@ -114,7 +161,7 @@ def http_get(url):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-                return r.read(), r.headers.get("Content-Type", "")
+                return r.read(), r.headers
         except urllib.error.HTTPError as e:
             if e.code not in (429, 502, 503, 504) or attempt == MAX_RETRIES:
                 raise
@@ -200,6 +247,19 @@ def fetch(product, params):
         return None, f"{type(e).__name__}: {e}", False
 
 
+def split_sets(sets, folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    for sid, st in sets.items():
+        for i, it in enumerate(st["items"]):
+            for k, v in enumerate(it["v"]):
+                if v["s"] and v["s"].startswith("data:"):
+                    head, b64 = v["s"].split(",", 1)
+                    img = base64.b64decode(b64)
+                    name = "x_" + hashlib.sha1(img).hexdigest()[:16] + {"image/gif": ".gif", "image/jpeg": ".jpg"}.get(head[5:].split(";")[0], ".png")
+                    (folder / name).write_bytes(img)
+                    v["s"] = f"{folder.name}/{name}"
+
+
 def split_images(R, folder):
     """Write embedded images out as files; the page then links to charts/<name>."""
     folder.mkdir(parents=True, exist_ok=True)
@@ -213,6 +273,145 @@ def split_images(R, folder):
             (folder / name).write_bytes(base64.b64decode(b64))
             src = f"{folder.name}/{name}"
         out[key] = (src, err, cached)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Charts from other sites (CPC, BoM, StratObserve)
+# --------------------------------------------------------------------------
+ARCHIVE_DIR = CACHE_DIR / "archive"
+MISSING_FILE = CACHE_DIR / "missing.json"
+
+
+def _data_uri(img, ctype):
+    ctype = (ctype or "image/png").split(";")[0].strip() or "image/png"
+    return "data:%s;base64,%s" % (ctype, base64.b64encode(img).decode())
+
+
+def _sniff(img):
+    if img[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if img[:3] == b"GIF":
+        return "image/gif"
+    if img[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    return None
+
+
+def fetch_static_versions(item, n):
+    """Current image plus previous versions this script has archived. Newest first."""
+    key = hashlib.sha1(item["url"].encode()).hexdigest()[:12]
+    index_path = ARCHIVE_DIR / f"{key}.json"
+    try:
+        index = json.loads(index_path.read_text())
+    except (OSError, ValueError):
+        index = []
+    err = None
+    try:
+        img, headers = http_get_full(item["url"])
+        if not _sniff(img):
+            raise RuntimeError("the site did not return an image")
+        h = hashlib.sha1(img).hexdigest()[:16]
+        if not index or index[-1]["hash"] != h:
+            ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+            fname = f"{key}_{h}.img"
+            (ARCHIVE_DIR / fname).write_bytes(img)
+            lm = headers.get("Last-Modified")
+            try:
+                when = datetime.strptime(lm, "%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc) if lm else None
+            except ValueError:
+                when = None
+            index.append({"hash": h, "file": fname, "type": _sniff(img),
+                          "time": (when or datetime.now(timezone.utc)).isoformat(), "from_header": bool(when)})
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    # keep only what is needed
+    keep = index[-max(n, 1):]
+    for old in index[:-max(n, 1)]:
+        try:
+            (ARCHIVE_DIR / old["file"]).unlink()
+        except OSError:
+            pass
+    if keep != index or err is None:
+        try:
+            ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+            index_path.write_text(json.dumps(keep))
+        except OSError:
+            pass
+    versions = []
+    for ent in reversed(keep):
+        t = datetime.fromisoformat(ent["time"])
+        lab = ("updated " if ent.get("from_header") else "fetched ") + f"{t:%a %d %b %H:%M} UTC"
+        try:
+            src = _data_uri((ARCHIVE_DIR / ent["file"]).read_bytes(), ent.get("type"))
+            versions.append({"s": src, "e": None, "lab": lab, "l": item.get("page", item["url"])})
+        except OSError as e:
+            versions.append({"s": None, "e": str(e), "lab": lab, "l": item.get("page", item["url"])})
+    if err and versions:
+        versions[0]["lab"] += " (latest download failed - showing last saved)"
+    if not versions:
+        versions.append({"s": None, "e": err or "no image", "lab": "", "l": item.get("page", item["url"])})
+    return versions, err
+
+
+def fetch_dated_versions(item, n):
+    """Newest n dated images found within the look-back window. Newest first."""
+    try:
+        missing = set(json.loads(MISSING_FILE.read_text()))
+    except (OSError, ValueError):
+        missing = set()
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    versions, last_err = [], None
+    for back in range(-1, item.get("lookback", 14) + 1):
+        if len(versions) >= n:
+            break
+        d = today - timedelta(days=back)
+        url = item["url"].format(date=d.strftime("%Y%m%d"))
+        if url in missing:
+            continue
+        cp = CACHE_DIR / ("url_" + hashlib.sha1(url.encode()).hexdigest()[:16] + ".img")
+        try:
+            if USE_CACHE[0] and cp.exists() and cp.stat().st_size > 0:
+                img = cp.read_bytes()
+            else:
+                img, _ = http_get(url)
+                if not _sniff(img):
+                    raise RuntimeError("not an image")
+                try:
+                    CACHE_DIR.mkdir(exist_ok=True)
+                    cp.write_bytes(img)
+                except OSError:
+                    pass
+            versions.append({"s": _data_uri(img, _sniff(img)), "e": None,
+                             "lab": f"issued {d:%a %d %b}", "l": item.get("page", url)})
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTPError {e.code}"
+            if e.code == 404 and back > 3:      # old dates never appear later
+                missing.add(url)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        MISSING_FILE.write_text(json.dumps(sorted(missing)))
+    except OSError:
+        pass
+    if not versions:
+        versions.append({"s": None, "e": last_err or "nothing found", "lab": "", "l": item.get("page", item["url"])})
+        return versions, last_err
+    return versions, None
+
+
+def collect_sets(sets):
+    out = {}
+    for st in sets:
+        items = []
+        for it in st["items"]:
+            fn = fetch_static_versions if it["kind"] == "static" else fetch_dated_versions
+            versions, err = fn(it, st["history"])
+            got = sum(1 for v in versions if v["s"])
+            print(f"  {st['id']:<9} {it['label'][:44]:<46} {got} version(s)" + (f"  [{err}]" if err else ""))
+            items.append({"label": it["label"], "crop": it.get("crop"), "v": versions})
+        out[st["id"]] = {"title": st["title"], "n": st["history"], "items": items}
     return out
 
 
@@ -286,7 +485,17 @@ header .meta { color:var(--muted); font-size:13px; }
 .bar button.on, .ctl button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
 main { padding:16px; max-width:1800px; margin:0 auto; }
 .tab { display:none; }
-body[data-tab=met] #tab-met, body[data-tab=ext] #tab-ext, body[data-tab=strat] #tab-strat { display:block; }
+body[data-tab=met] #tab-met, body[data-tab=ext] #tab-ext, body[data-tab=tele] #tab-tele, body[data-tab=strat] #tab-strat { display:block; }
+.rs { --col:440px; --sbs:400px; }
+.rs.size-s { --col:320px; --sbs:300px; }
+.rs.size-l { --col:640px; --sbs:560px; }
+.rs .rs-flick { grid-template-columns:repeat(auto-fill, min(var(--col), 100%)); }
+.rs .rs-sbs { display:none; }
+.rs.sbs .rs-sbs { display:block; }
+.rs.sbs .rs-flick { display:none; }
+.rs .rs-sbs .row { grid-template-columns:repeat(auto-fill, min(var(--sbs), 100%)); gap:12px; margin-bottom:14px; }
+.rs .when { display:block; font-size:12px; }
+#tab-strat > section:first-child .row.two { grid-template-columns:repeat(auto-fill, min(620px, 100%)); }
 section { margin-bottom:28px; scroll-margin-top:110px; }
 h2 { font-size:18px; margin:0 0 4px; }
 h3 { font-size:16px; margin:0 0 8px; }
@@ -460,6 +669,62 @@ const AN = (() => {
   return { show, st };
 })();
 
+// run sets (Teleconnections / Stratosphere): one slider per set
+const RS = [...document.querySelectorAll('.rs')].map(sec => {
+  const data = JSON.parse(sec.querySelector('.rs-data').textContent), n = data.n;
+  const ctl = sec.querySelector('.rs-ctl');
+  const st = { sec, idx: n - 1, n, timer: null };       // slider: 0 = oldest, n-1 = latest
+  function fill(fig, k) {                                // k: 0 = latest, 1 = previous, ...
+    const v = data.items[+fig.dataset.i].v[k];
+    const img = fig.querySelector('img'), err = fig.querySelector('.err');
+    if (v && v.s) {
+      if (img.dataset.orig !== v.s) { img.dataset.orig = v.s; img.src = v.s; }
+      img.style.display = ''; err.style.display = 'none';
+    } else {
+      img.style.display = 'none'; err.style.display = '';
+      err.textContent = v ? 'Not available: ' + (v.e || '') : 'No earlier version saved yet';
+    }
+    fig.querySelector('.when').textContent = v ? (v.lab || '') : '';
+    if (v) fig.querySelector('a').href = v.l;
+  }
+  function show(i) {
+    st.idx = (i + n) % n;
+    const k = n - 1 - st.idx;
+    sec.querySelectorAll('.rs-flick .rsf').forEach(f => fill(f, k));
+    if (ctl) {
+      ctl.querySelector('.lab').textContent = k === 0 ? 'Latest' : k === 1 ? 'Previous' : k + ' versions back';
+      ctl.querySelector('input').value = st.idx;
+    }
+  }
+  sec.querySelectorAll('.rs-sbs .rsf').forEach(f => fill(f, +f.dataset.k));
+  if (ctl) {
+    ctl.querySelector('input').oninput = e => show(+e.target.value);
+    ctl.querySelector('.prev').onclick = () => show(st.idx - 1);
+    ctl.querySelector('.next').onclick = () => show(st.idx + 1);
+    ctl.querySelector('.play').onclick = () => {
+      if (st.timer) { clearInterval(st.timer); st.timer = null; } else st.timer = setInterval(() => show(st.idx + 1), 1200);
+      ctl.querySelector('.play').classList.toggle('on', !!st.timer);
+    };
+    ctl.querySelectorAll('.layout button').forEach(b => b.onclick = () => {
+      sec.classList.toggle('sbs', b.dataset.lay === 'sbs');
+      ctl.querySelectorAll('.layout button').forEach(x => x.classList.toggle('on', x === b));
+    });
+  }
+  show(n - 1);
+  st.show = show;
+  return st;
+});
+function activeRunset() {      // the set nearest the top of the screen in the current tab
+  const tab = document.getElementById('tab-' + body.dataset.tab);
+  let best = null;
+  RS.forEach(r => {
+    if (!tab || !tab.contains(r.sec) || r.n < 2) return;
+    const t = r.sec.getBoundingClientRect().top;
+    if (t < innerHeight / 2 && (!best || t > best.t)) best = { r, t };
+  });
+  return best ? best.r : null;
+}
+
 function activeGroup() {
   if (body.dataset.tab === 'met' && met.classList.contains('compare')) return 'met';
   if (body.dataset.tab === 'ext') {
@@ -467,6 +732,7 @@ function activeGroup() {
     if (!AN || (hov && hov.getBoundingClientRect().top < innerHeight / 2)) return 'hov';
     return 'anom';
   }
+  if (body.dataset.tab === 'tele' || body.dataset.tab === 'strat') return 'rs';
   return null;
 }
 
@@ -497,17 +763,20 @@ document.querySelectorAll('.sizer').forEach(sp => {
 });
 
 // trim white margins off meteograms (done in the browser, once per image)
-const TRIM_SELECTOR = '#tab-met figure img, #anoms figure img, #hov figure img';
+const TRIM_SELECTOR = '#tab-met figure img, #anoms figure img, #hov figure img, #tab-tele figure img, #tab-strat figure img';
 const trimmed = new Map();              // original src -> trimmed src
 const trimmedSet = new Set();
 function trim(img) {
   const src = img.currentSrc || img.src;
   if (!src || trimmedSet.has(src)) return;
   if (trimmed.has(src)) { img.src = trimmed.get(src); return; }
-  const w = img.naturalWidth, h = img.naturalHeight;
-  if (!w || !h) return;
+  const fig = img.closest('figure'), cr = fig && fig.dataset.crop ? fig.dataset.crop.split(',').map(Number) : null;
+  const W = img.naturalWidth, H = img.naturalHeight;
+  if (!W || !H) return;
+  const sx = cr ? Math.round(cr[0] * W) : 0, sy = cr ? Math.round(cr[1] * H) : 0;
+  const w = cr ? Math.round((cr[2] - cr[0]) * W) : W, h = cr ? Math.round((cr[3] - cr[1]) * H) : H;
   const c = document.createElement('canvas'); c.width = w; c.height = h;
-  const cx = c.getContext('2d'); cx.drawImage(img, 0, 0);
+  const cx = c.getContext('2d'); cx.drawImage(img, sx, sy, w, h, 0, 0, w, h);
   let d; try { d = cx.getImageData(0, 0, w, h).data; } catch (e) { return; }
   const blank = (x, y) => { const i = (y * w + x) * 4; return d[i + 3] < 10 || (d[i] > 245 && d[i + 1] > 245 && d[i + 2] > 245); };
   const rowBlank = y => { for (let x = 0; x < w; x += 2) if (!blank(x, y)) return false; return true; };
@@ -521,7 +790,7 @@ function trim(img) {
   top = Math.max(0, top - pad); left = Math.max(0, left - pad);
   bot = Math.min(h - 1, bot + pad); right = Math.min(w - 1, right + pad);
   const cw = right - left + 1, ch = bot - top + 1;
-  if (cw * ch > 0.97 * w * h) { trimmedSet.add(src); return; }   // nothing worth trimming
+  if (!cr && cw * ch > 0.97 * w * h) { trimmedSet.add(src); return; }   // nothing worth trimming
   const o = document.createElement('canvas'); o.width = cw; o.height = ch;
   o.getContext('2d').drawImage(c, left, top, cw, ch, 0, 0, cw, ch);
   const out = o.toDataURL('image/png');
@@ -574,7 +843,8 @@ document.addEventListener('keydown', e => {
   if (e.target.matches('textarea, input')) return;
   const g = activeGroup(); if (!g) return;
   const step = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0; if (!step) return;
-  if (g === 'anom') AN.show(AN.st.idx + step); else show(g, groups[g].idx + step);
+  if (g === 'rs') { const r = activeRunset(); if (r) r.show(r.idx + step); }
+  else if (g === 'anom') AN.show(AN.st.idx + step); else show(g, groups[g].idx + step);
 });
 """
 
@@ -742,8 +1012,43 @@ def extended_tab(anom_bt, weeks, anom_history, hov_latest, hov_history, R):
     return "\n".join(parts)
 
 
-def strat_tab(strat_bts, R):
-    parts = ['<section><h2>Stratosphere</h2><div class="row two">']
+def runset_html(sid, st):
+    """One run slider driving a set of charts (flick), or each chart's versions in a row (side by side)."""
+    n, items = st["n"], st["items"]
+    def fig(i, k=None):
+        it = items[i]
+        crop = f' data-crop="{",".join(str(c) for c in it["crop"])}"' if it.get("crop") else ""
+        kk = "" if k is None else f' data-k="{k}"'
+        return (f'<figure class="rsf" data-i="{i}"{kk}{crop}><figcaption><span>{esc(it["label"])}'
+                f'<span class="when"></span></span><a target="_blank" rel="noopener">source</a></figcaption>'
+                f'<img alt="{esc(it["label"])}"><div class="err" style="display:none"></div></figure>')
+    flick = "".join(fig(i) for i in range(len(items)))
+    sbs = "".join(f'<h3>{esc(it["label"])}</h3><div class="row">' +
+                  "".join(fig(i, k) for k in reversed(range(n))) + '</div>'
+                  for i, it in enumerate(items))
+    ctl = ""
+    if n > 1:
+        ctl = (f'<div class="ctl rs-ctl"><button class="prev" title="Older">&larr;</button>'
+               f'<input type="range" min="0" max="{n - 1}" step="1" value="{n - 1}">'
+               f'<button class="next" title="Newer">&rarr;</button><button class="play">Play</button>'
+               f'<span class="lab"></span><span class="layout" style="margin-left:auto;display:flex;gap:6px">'
+               f'<button data-lay="flick" class="on">Flick</button><button data-lay="sbs">Side by side</button></span></div>')
+    data = json.dumps({"n": n, "items": [{"v": it["v"]} for it in items]}).replace("</", "<\\/")
+    return (f'<section class="rs" id="rs-{sid}"><h2>{esc(st["title"])}</h2>'
+            f'<div class="bar"><span class="hint" style="margin:0">Size</span>{sizer("rs-" + sid)}</div>{ctl}'
+            f'<div class="row rs-flick">{flick}</div><div class="rs-sbs">{sbs}</div>'
+            f'<script type="application/json" class="rs-data">{data}</script></section>')
+
+
+def tele_tab(sets):
+    out = [runset_html(st["id"], sets[st["id"]]) for st in TELE_SETS if st["id"] in sets]
+    out.append('<p class="hint">Charts with a fixed web address (CPC) are overwritten by their site, so this page keeps its own '
+               'copies: "previous" versions build up over the first few days of running.</p>')
+    return "\n".join(out)
+
+
+def strat_tab(strat_bts, R, sets=None):
+    parts = ['<section><h2>ECMWF</h2><div class="row two">']
     for i, (prod, params, label) in enumerate(STRAT_CHARTS):
         bt = strat_bts[i]
         if bt is None:
@@ -753,6 +1058,9 @@ def strat_tab(strat_bts, R):
         parts.append(figure_html(f"{label} – run {run_label(bt, True)}", site_url(prod, p),
                                  R[("strat", i, bt)], label))
     parts.append('</div></section>')
+    for st in STRAT_SETS:
+        if sets and st["id"] in sets:
+            parts.append(runset_html(st["id"], sets[st["id"]]))
     return "\n".join(parts)
 
 
@@ -771,13 +1079,15 @@ def build_html(ctx, R):
   <div class="tabs">
     <button data-tab="met" class="on">Meteograms</button>
     <button data-tab="ext">Extended Outlook</button>
+    <button data-tab="tele">Teleconnections</button>
     <button data-tab="strat">Stratosphere</button>
   </div>
 </header>
 <main>
 <div class="tab" id="tab-met">{meteogram_tab(ctx["met_latest"], ctx["met_history"], R)}</div>
 <div class="tab" id="tab-ext">{extended_tab(ctx["anom_bt"], ctx["weeks"], ctx["anom_history"], ctx["hov_latest"], ctx["hov_history"], R)}</div>
-<div class="tab" id="tab-strat">{strat_tab(ctx["strat_bts"], R)}</div>
+<div class="tab" id="tab-tele">{tele_tab(ctx["sets"])}</div>
+<div class="tab" id="tab-strat">{strat_tab(ctx["strat_bts"], R, ctx["sets"])}</div>
 </main>
 <footer>Charts &copy; ECMWF, licensed under CC BY 4.0 &middot; charts.ecmwf.int</footer>
 <div id="zoom"><img alt=""></div>
@@ -876,13 +1186,17 @@ def main():
             desc = " ".join(f"{x:%d %b %HZ}" if isinstance(x, datetime) else str(x) for x in k)
             print(f"  {desc:<60} {status}")
 
-    ctx = dict(met_latest=met_latest, met_history=met_history, anom_bt=anom_bt, weeks=weeks, anom_history=anom_history,
+    print("Fetching charts from other sites...")
+    sets = collect_sets(TELE_SETS + STRAT_SETS)
+
+    ctx = dict(sets=sets, met_latest=met_latest, met_history=met_history, anom_bt=anom_bt, weeks=weeks, anom_history=anom_history,
                hov_latest=hov_latest, hov_history=hov_history, strat_bts=strat_bts)
     stamp = (met_latest or datetime.now(timezone.utc)).strftime("%Y%m%d%H")
     out = Path(args.out or f"ens_grams_{stamp}.html").resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     if args.split:
         R = split_images(R, out.parent / "charts")
+        split_sets(sets, out.parent / "charts")
     out.write_text(build_html(ctx, R), encoding="utf-8")
     ok = sum(1 for v in R.values() if v[0])
     print(f"Wrote {out}  ({ok}/{len(R)} charts)")
