@@ -70,7 +70,7 @@ ANOMALY_MAPS = [
 ]
 
 ANOMALY_WEEKS = 5            # how many weeks ahead to show
-ANOMALY_HISTORY = 3          # anomaly-map runs to compare, incl. latest (24 h apart)
+ANOMALY_HISTORY = 4          # anomaly-map runs to compare, incl. latest (24 h apart)
 
 HOVMOLLER_PRODUCT = "mofc_multi_eps_family_hovmoller"
 HOVMOLLERS = [
@@ -536,9 +536,9 @@ CSS = r"""
 * { box-sizing:border-box; }
 html { -webkit-text-size-adjust:100%; }
 body { margin:0; font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink);
-       --col:460px; --col-all:360px; }
-body.size-s { --col:330px; --col-all:260px; }
-body.size-l { --col:680px; --col-all:520px; }
+       --col:460px; --col-all:325px; }
+body.size-s { --col:330px; --col-all:240px; }
+body.size-l { --col:680px; --col-all:460px; }
 button { font:inherit; color:inherit; }
 
 /* header */
@@ -578,6 +578,7 @@ section.collapsed .chev { transform:rotate(-90deg); }
 section.collapsed .sbody { display:none; }
 .bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:4px 0 10px; }
 .bar .gap { width:10px; }
+.bar.pages { margin-bottom:2px; }
 .bar .lab { color:var(--muted); font-size:12.5px; margin-right:2px; }
 .bar .right { margin-left:auto; }
 .grid { display:grid; gap:10px; grid-template-columns:repeat(auto-fill, min(var(--col), 100%)); }
@@ -648,7 +649,7 @@ const h = (tag, attrs = {}, ...kids) => {
 const SEC = {};        // id -> {def, tab, ver, page, mode, timer, el}
 const GROUP = {};      // sync group -> [section ids]
 M.tabs.forEach(t => t.sections.forEach(s => {
-  SEC[s.id] = { def: s, tab: t.id, ver: 0, page: 0, mode: 'one', timer: null, el: null };
+  SEC[s.id] = { def: s, tab: t.id, ver: 0, page: 0, view: 0, mode: 'one', timer: null, el: null };
   if (s.sync) (GROUP[s.sync] = GROUP[s.sync] || []).push(s.id);
 }));
 const collapsed = new Set(store.get('collapsed', []));
@@ -734,11 +735,17 @@ function renderNotes(id) {
 function buildSection(sd) {
   const s = SEC[sd.id];
   const bar = h('div', { class: 'bar' });
-  if (sd.pages.length > 1) {
-    sd.pages.forEach((p, i) => bar.append(h('button', { class: 'chip pbtn', 'data-p': i,
+  const pagebar = h('div', { class: 'bar pages' });
+  const drawPages = () => {
+    pagebar.innerHTML = '';
+    if (sd.views) pagebar.append(h('span', { class: 'seg' }, sd.views.map((v, i) => h('button', { class: i === s.view ? 'on' : null,
+      onclick: () => { s.view = i; sd.pages = sd.views[i].pages; s.page = 0; store.set('view:' + sd.id, i); drawPages(); renderGrid(sd.id); } }, v.label))),
+      h('span', { class: 'gap' }));
+    if (sd.pages.length > 1) sd.pages.forEach((p, i) => pagebar.append(h('button', { class: 'chip pbtn', 'data-p': i,
       onclick: () => { s.page = i; renderGrid(sd.id); } }, p.label)));
-    bar.append(h('span', { class: 'gap' }));
-  }
+  };
+  if (sd.views) { s.view = Math.min(store.get('view:' + sd.id, 0), sd.views.length - 1); sd.pages = sd.views[s.view].pages; s.page = Math.min(s.page, sd.pages.length - 1); }
+  drawPages();
   if (sd.versions.length > 1) {
     bar.append(h('span', { class: 'lab' }, 'Run'));
     sd.versions.forEach((v, k) => bar.append(h('button', { class: 'chip vbtn', 'data-k': k, title: v.long,
@@ -754,7 +761,7 @@ function buildSection(sd) {
       store.set('collapsed', [...collapsed]); } },
     h('span', { class: 'chev' }, '▾'), h('h2', {}, sd.title), sd.sub ? h('small', {}, sd.sub) : null);
   const el = h('section', { class: 'sec' + (collapsed.has(sd.id) ? ' collapsed' : ''), id: sd.id }, head,
-    h('div', { class: 'sbody' }, bar.childNodes.length ? bar : null, h('div', { class: 'charts' }),
+    h('div', { class: 'sbody' }, pagebar.childNodes.length ? pagebar : null, bar.childNodes.length ? bar : null, h('div', { class: 'charts' }),
       sd.hint ? h('p', { class: 'hint' }, sd.hint) : null, h('div', { class: 'notesbox' })));
   s.el = el;
   renderGrid(sd.id);
@@ -911,7 +918,7 @@ function saveCopy() {
   model.imgs = model.imgs.map(u => u.startsWith('data:') ? u : new URL(u, location.href).href);
   $('#model', doc).textContent = JSON.stringify(model).replace(/<\//g, '<\\/');
   const notes = Object.assign({}, savedNotes);
-  M.tabs.forEach(t => t.sections.forEach(s => [s.notes, ...s.pages.map(p => p.notes)].forEach(n => {
+  M.tabs.forEach(t => t.sections.forEach(s => [s.notes, ...s.pages.map(p => p.notes), ...(s.views || []).flatMap(v => v.pages.map(p => p.notes))].forEach(n => {
     if (n) { const v = store.get('notes:' + n.key, null); if (v !== null) notes[n.key] = v; } })));
   $('#saved-notes', doc).textContent = JSON.stringify(notes).replace(/<\//g, '<\\/');
   const a = h('a', { download: (location.pathname.split('/').pop() || 'met_charts.html').replace(/(_notes)?\.html?$/i, '').replace(/^$/, 'met_charts') + '_notes.html' });
@@ -1021,18 +1028,29 @@ def build_model(ctx, R):
         def cell(prod, proj, w, label):
             return {"label": label, "v": [V(R[("anom", prod, w, bt)],
                     site_url(prod, {"base_time": bt, "projection": proj, "valid_time": w})) for bt in ahist]}
-        pages = []
+        # ECMWF labels each weekly mean by the time it ENDS (Monday 00 UTC), so the week covers the 7 days before
+        def wk(w, long=False):
+            start, end = w - timedelta(days=7), w - timedelta(days=1)
+            if long:
+                return f"{start:%a %d %b} \u2013 {end:%a %d %b}"
+            return (f"{start:%d}\u2013{end:%d %b}" if start.month == end.month
+                    else f"{start:%d %b}\u2013{end:%d %b}")
+        all_notes = {"key": f"anom:{abt:%Y%m%d%H}:all", "title": "Notes \u2013 all weeks"}
+        by_week = []
         for w in weeks:
-            pages.append({"label": f"{w:%d %b}", "items": [cell(p, pr, w, lab) for p, pr, lab in ANOMALY_MAPS],
-                          "notes": {"key": f"anom:{abt:%Y%m%d%H}:{w:%Y%m%d}", "title": f"Notes – week of {w:%a %d %b}"}})
-        pages.append({"label": "All weeks",
-                      "items": [cell(p, pr, w, f"{lab} · wk {w:%d %b}") for p, pr, lab in ANOMALY_MAPS for w in weeks],
-                      "notes": {"key": f"anom:{abt:%Y%m%d%H}:all", "title": "Notes – all weeks"}})
-        for pg in pages[:-1]:
-            check("ext", "anoms", f"Weekly anomalies · week of {pg['label']}", pg["items"])
+            by_week.append({"label": wk(w), "items": [cell(p, pr, w, lab) for p, pr, lab in ANOMALY_MAPS],
+                            "notes": {"key": f"anom:{abt:%Y%m%d%H}:{w:%Y%m%d}", "title": f"Notes \u2013 week {wk(w, True)}"}})
+        by_week.append({"label": "All weeks",
+                        "items": [cell(p, pr, w, f"{lab} \u00b7 {wk(w)}") for p, pr, lab in ANOMALY_MAPS for w in weeks],
+                        "notes": all_notes})
+        by_param = [{"label": lab, "items": [cell(p, pr, w, f"Week {wk(w)}") for w in weeks], "notes": all_notes}
+                    for p, pr, lab in ANOMALY_MAPS]
+        for pg in by_week[:-1]:
+            check("ext", "anoms", f"Weekly anomalies \u00b7 week {pg['label']}", pg["items"])
         check("ext", "anoms", "Weekly anomalies", [], ahist[0], 60)
-        secs.append({"id": "anoms", "title": "Weekly mean anomalies", "sub": "week starting (Monday)",
-                     "versions": run_versions(ahist, 24), "pages": pages})
+        secs.append({"id": "anoms", "title": "Weekly mean anomalies", "sub": "7-day means",
+                     "versions": run_versions(ahist, 24), "pages": by_week,
+                     "views": [{"label": "By week", "pages": by_week}, {"label": "By parameter", "pages": by_param}]})
     hhist = list(reversed(ctx["hov_history"]))
     if hhist:
         its = [{"label": label, "v": [V(R[("hov", i, bt)], site_url(HOVMOLLER_PRODUCT, dict(params, base_time=bt)))
